@@ -1,0 +1,10 @@
+# Planner: splits the task into sub-questions.
+prompt = "planner"          # prompts/<prompt>.md
+request_limit = 5           # model requests per run
+timeout_s = 900             # wall-clock cap per run
+
+output_mode = "prompted"     # prompted | native | tool  (LLM_OUTPUT_MODE overrides)
+
+[model_settings]            # passed straight to the model; any OpenAI-compatible knob
+temperature = 0.2
+max_tokens = 16384

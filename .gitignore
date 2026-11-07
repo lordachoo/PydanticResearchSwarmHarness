@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local config with endpoints and tokens: copy sourceMe.example -> sourceMe
+sourceMe
+.env
+.env.*
+
+# Run output and logs
+reports/
+debug.log
+*.log
+
+# Local agent-tool state
+.pydantic-deep/
+.claude/

@@ -1,0 +1,4 @@
+pydantic-ai>=2.60
+httpx
+uvicorn
+watchfiles

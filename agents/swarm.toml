@@ -1,0 +1,5 @@
+# Swarm-wide settings (endpoints and tokens stay in env vars / sourceMe).
+max_workers = 4             # concurrent researchers; keep <= vLLM --max-num-seqs
+min_subquestions = 1
+max_subquestions = 5
+output_retries = 3          # structured-output validation retries per agent

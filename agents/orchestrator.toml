@@ -1,0 +1,7 @@
+# Orchestrator: the agent behind the web chat UI; its only tool runs the swarm.
+# The swarm's own limits and timeouts are in the other tomls.
+prompt = "orchestrator"
+
+[model_settings]
+temperature = 0.3
+max_tokens = 16384

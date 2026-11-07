@@ -1,0 +1,9 @@
+# sourceMe — copy to `sourceMe` (gitignored), fill in, then:   source sourceMe
+source .venv/bin/activate
+export LLM_BASE_URL="http://<llm-host>:8080/v1"       # OpenAI-compatible; must end in /v1
+export LLM_MODEL="qwen3.5-122b"                       # id as /v1/models reports it
+export CRAWL4AI_URL="http://127.0.0.1:11235"
+export CRAWL4AI_API_TOKEN="<token>"                   # bearer token set on the Crawl4AI container
+export SEARXNG_URL="http://<services-host>:8888"      # JSON format must be enabled
+export DOCLING_URL="http://<services-host>:5001"      # docling-serve; PDFs go here
+# export LLM_DEBUG=1     # dump every request's message roles to stderr

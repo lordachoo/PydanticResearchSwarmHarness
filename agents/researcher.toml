@@ -1,0 +1,18 @@
+# Researcher: one per sub-question, runs in parallel, has web_search + fetch_page.
+# Tool limits must stay ABOVE [model_settings]; anything under that header is
+# sent to the model as a request parameter.
+prompt = "researcher"
+request_limit = 55
+timeout_s = 900
+max_fetches = 10
+min_fetches = 2             # output validator rejects findings below this
+max_searches = 25
+pdf_page_limit = 100         # pages docling converts per PDF
+pdf_char_limit = 40000      # chars kept from each PDF
+page_char_limit = 10000     # chars kept from each HTML page
+
+output_mode = "prompted"     # prompted | native | tool  (LLM_OUTPUT_MODE overrides)
+
+[model_settings]
+temperature = 0.3
+max_tokens = 16384

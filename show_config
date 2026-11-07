@@ -1,0 +1,47 @@
+#!/bin/bash
+# Dump the swarm's configuration: swarm-wide settings, then for each agent its
+# toml followed by its prompt. Run from anywhere; it locates its own directory.
+
+cd "$(dirname "$0")" || exit 1
+
+rule() { printf '%s\n' "════════════════════════════════════════════════════════════════════════"; }
+sub()  { printf '%s\n' "────────────────────────────────────────────────────────────────────────"; }
+
+rule
+echo "SWARM SETTINGS  (agents/swarm.toml)"
+rule
+cat agents/swarm.toml
+echo
+
+for toml in agents/*.toml; do
+    name=$(basename "$toml" .toml)
+    [ "$name" = "swarm" ] && continue
+
+    # prompt = "<file>" inside the toml names the prompt file; fall back to the agent name
+    prompt_name=$(sed -n 's/^prompt *= *"\([^"]*\)".*/\1/p' "$toml")
+    prompt_file="prompts/${prompt_name:-$name}.md"
+
+    rule
+    echo "AGENT: $name"
+    rule
+    echo "[$toml]"
+    sub
+    cat "$toml"
+    echo
+    echo "[$prompt_file]"
+    sub
+    if [ -f "$prompt_file" ]; then
+        cat "$prompt_file"
+    else
+        echo "(missing: $prompt_file)"
+    fi
+    echo
+done
+
+rule
+echo "ENVIRONMENT  (current shell)"
+rule
+for v in LLM_BASE_URL LLM_MODEL CRAWL4AI_URL SEARXNG_URL DOCLING_URL LLM_DEBUG; do
+    printf '%-20s %s\n' "$v" "${!v:-(unset)}"
+done
+printf "%-20s %s\n" "CRAWL4AI_API_TOKEN" "$([ -n "$CRAWL4AI_API_TOKEN" ] && echo "(set)" || echo "(unset)")"
