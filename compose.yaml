@@ -1,0 +1,46 @@
+# Support services for the research swarm: SearXNG, Crawl4AI, docling-serve.
+#
+# Use ./services (menu or subcommands) rather than calling this directly: it
+# writes .services/env (ports, bind address, Crawl4AI token) and the SearXNG
+# settings file this compose project expects, and checks for port conflicts.
+#
+# Direct use:  docker compose --env-file .services/env up -d [service ...]
+
+name: research-swarm
+
+services:
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${SEARXNG_PORT:-8888}:8080"
+    environment:
+      SEARXNG_BASE_URL: "http://localhost:${SEARXNG_PORT:-8888}/"
+    volumes:
+      # Only the settings file, read-only: SearXNG chowns a mounted config
+      # directory to its own uid, which leaves the host copy uneditable.
+      - ./.services/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+
+  crawl4ai:
+    image: ${CRAWL4AI_IMAGE:-unclecode/crawl4ai:latest}
+    restart: unless-stopped
+    shm_size: 1g          # headless Chromium crashes with Docker's 64 MB default
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${CRAWL4AI_PORT:-11235}:11235"
+    environment:
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?run ./services to generate a token}
+
+  docling:
+    # The OCR/layout models ship inside the image (~15 GB), so no cache volume.
+    # For GPU OCR, set DOCLING_IMAGE to a CUDA tag from the docling-serve README
+    # and add a GPU reservation.
+    image: ${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:latest}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${DOCLING_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "1"
+
+volumes:
+  searxng-cache:

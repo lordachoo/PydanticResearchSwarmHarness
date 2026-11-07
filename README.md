@@ -58,16 +58,18 @@ so the services can share one machine or be spread across several.
 
 ## 1. Quick start
 
-Assumes an LLM endpoint and the three services are already running (see
-[§5](#5-setting-up-the-services) and [§6](#6-setting-up-an-llm-endpoint)).
+Assumes an LLM endpoint is already running (see
+[§6](#6-setting-up-an-llm-endpoint)). The three support services can be started
+for you with Docker (see [§5](#5-setting-up-the-services)).
 
 ```bash
 git clone <this repo> research-swarm && cd research-swarm
 python3 -m venv .venv && source .venv/bin/activate
 pip install -U pip && pip install -r requirements.txt
 
-cp sourceMe.example sourceMe     # gitignored; holds your endpoints and token
-$EDITOR sourceMe
+./services up                    # SearXNG + Crawl4AI + docling in Docker (skip if you run your own)
+./services write-env             # creates/updates sourceMe with their URLs and token
+$EDITOR sourceMe                 # set LLM_BASE_URL and LLM_MODEL
 source sourceMe
 
 python doctor.py                 # preflight: services reachable, tool calling works
@@ -90,6 +92,7 @@ Results print to the terminal and are saved under `reports/<timestamp>/`.
 | Component | Purpose | Requirement |
 |---|---|---|
 | Python | runs the swarm | 3.12+ (uses `tomllib`) |
+| Docker + Compose plugin | `./services` (optional) | only if you want the support services started for you |
 | pydantic-ai | agent framework | ≥ 2.60 (`requirements.txt`) |
 | LLM endpoint | all agents | OpenAI-compatible `/v1/chat/completions` with **tool calling** |
 | [SearXNG](https://github.com/searxng/searxng) | `web_search` | JSON output format enabled |
@@ -260,73 +263,106 @@ The run is always saved to `reports/`, even if every agent fails.
 
 ## 5. Setting up the services
 
-Each service is a single Docker container. Use any host the swarm can reach and
-put the URLs in `sourceMe`.
+The swarm needs SearXNG (search), Crawl4AI (HTML pages) and docling-serve
+(PDFs). They can run anywhere the swarm can reach; only the URLs in `sourceMe`
+matter. Already running your own? Skip this section and put their URLs in
+`sourceMe`.
 
-### 5.1 SearXNG (web search)
+### 5.1 With `./services` (Docker Compose)
+
+`./services` wraps [`compose.yaml`](compose.yaml). It needs Docker Engine with
+the Compose plugin. Run it with no arguments for a menu, or use subcommands:
+
+| Command | What it does |
+|---|---|
+| `./services` | Interactive menu: status, start, stop, logs, write `sourceMe` |
+| `./services up [searxng crawl4ai docling]` | Start all services, or just the ones named; waits until each one answers HTTP |
+| `./services status` | Container state and an HTTP health check per service |
+| `./services logs <service>` | Follow a service's logs |
+| `./services env` | Print the `sourceMe` lines for these services |
+| `./services write-env` | Write those lines into `sourceMe` (created from `sourceMe.example` if missing; old copy kept as `sourceMe.bak`) |
+| `./services down` | Stop and remove this project's containers |
+
+On first run it creates these files (both gitignored):
+
+- `.services/env`: bind address, ports, a generated Crawl4AI token and
+  optional image overrides. Mode 600. Edit it, then run `./services up` again.
+- `.services/searxng/settings.yml`: SearXNG config with the JSON API enabled,
+  the rate limiter off and a random secret key. It is mounted read-only, so it
+  stays editable on the host; run `docker compose --env-file .services/env
+  restart searxng` after editing.
+
+Notes:
+
+- **Bind address.** Ports bind to `127.0.0.1` by default, so only this machine
+  can reach them. Set `BIND_ADDR=0.0.0.0` in `.services/env` if the swarm runs
+  on another host. SearXNG and docling have no authentication, so keep them off
+  untrusted networks.
+- **Port conflicts.** If a port is already taken (for example by a SearXNG you
+  started yourself), that service is skipped with a warning; nothing is
+  replaced. Use your existing one, or change the port in `.services/env`.
+- **Isolation.** Everything runs as the Compose project `research-swarm`, so
+  `./services down` only removes its own containers.
+- **Image sizes.** The first `up` downloads about 400 MB for SearXNG, about
+  6 GB for Crawl4AI and about 15 GB for docling. To skip PDFs, leave docling
+  out: `./services up searxng crawl4ai`.
+
+### 5.2 Manual `docker run`
+
+The equivalent manual setup, if you'd rather manage containers yourself.
+
+**SearXNG**
 
 ```bash
 mkdir -p ~/searxng
-docker run -d --name searxng --restart unless-stopped \
-  -p 8888:8080 -v ~/searxng:/etc/searxng \
+cat > ~/searxng/settings.yml <<EOF
+use_default_settings: true
+server:
+  secret_key: "$(openssl rand -hex 24)"
+  limiter: false        # the rate limiter blocks non-browser clients
+search:
+  formats: [html, json] # the JSON API returns 403 without json
+EOF
+docker run -d --name searxng --restart unless-stopped -p 8888:8080 \
+  -v ~/searxng/settings.yml:/etc/searxng/settings.yml:ro \
   -e SEARXNG_BASE_URL=http://<host>:8888/ \
   searxng/searxng:latest
-```
-
-The first start writes `~/searxng/settings.yml`. Make two edits there, then run
-`docker restart searxng`:
-
-```yaml
-search:
-  formats:
-    - html
-    - json          # the JSON API returns 403 without this
-server:
-  limiter: false    # the rate limiter blocks non-browser clients
-```
-
-```bash
 curl -s 'http://<host>:8888/search?q=test&format=json' | jq '.results[0].url'
 ```
 
-Engine health is at `/stats`.
+Mount the file rather than the directory. SearXNG chowns a mounted config
+directory to its own uid, and after that you can't edit it on the host without
+sudo. Engine health is at `/stats`.
 
-### 5.2 Crawl4AI (HTML → Markdown)
+**Crawl4AI (HTML → Markdown)**
 
 ```bash
 docker run -d --name crawl4ai --restart unless-stopped \
   -p 11235:11235 --shm-size=1g \
   -e CRAWL4AI_API_TOKEN=<pick-a-token> \
   unclecode/crawl4ai:latest
-```
-
-```bash
 curl -s -X POST http://<host>:11235/md -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" -d '{"url":"https://example.com"}' | jq '.markdown | length'
 ```
 
-The swarm reads the `markdown` key of the `/md` response; `doctor.py` flags it
-if your version names it differently. Crawl4AI drives headless Chromium, so it
-can't read PDFs (that's what docling is for). Sites behind bot protection return
-502; the researcher moves on.
+`--shm-size=1g` matters: headless Chromium crashes with Docker's 64 MB default.
+The swarm reads the `markdown` key of the `/md` response, and `doctor.py` flags
+it if your version names it differently. Crawl4AI can't read PDFs (that's what
+docling is for). Sites behind bot protection return 502, and the researcher
+moves on.
 
-### 5.3 docling-serve (PDF → Markdown, with OCR)
+**docling-serve (PDF → Markdown, with OCR)**
 
 ```bash
-mkdir -p ~/docling
 docker run -d --name docling --restart unless-stopped \
   -p 5001:5001 -e DOCLING_SERVE_ENABLE_UI=1 \
-  -v ~/docling:/root/.cache \
   ghcr.io/docling-project/docling-serve:latest
-```
-
-This is the CPU image; CUDA-tagged images speed up OCR. The volume caches OCR
-and layout models (a few hundred MB on first run). A test UI is at `/ui`.
-"RapidOCR returned empty result" warnings on born-digital PDFs are harmless.
-
-```bash
 curl -s http://<host>:5001/health
 ```
+
+The OCR and layout models ship inside the image, so no cache volume is needed.
+CUDA-tagged images speed up OCR. A test UI is at `/ui`. "RapidOCR returned empty
+result" warnings on born-digital PDFs are harmless.
 
 ---
 
@@ -374,6 +410,9 @@ Start with `python doctor.py`. Most problems show up as a FAIL line there.
 | Context-length errors from llama.cpp | Raise `-c`, or lower `max_tokens` / `page_char_limit` |
 | Researchers are slow or time out together | `max_workers` exceeds the server's parallel slots; requests queue |
 | SearXNG 403 on `format=json` | Add `json` to `search.formats` in `settings.yml` |
+| `./services up` skips a service: "port … already in use" | Something else holds the port (often your own instance); use it, or change the port in `.services/env` |
+| `./services`: "docker is installed but not usable" | Start Docker, or add yourself to the `docker` group and log in again |
+| Can't edit SearXNG `settings.yml` (owned by uid 977) | The config directory was mounted; mount just the file read-only (see §5.2) |
 | SearXNG returns 0 results | Upstream engines are rate-limiting you; check `/stats` |
 | Crawl4AI `401` | `CRAWL4AI_API_TOKEN` doesn't match the container's |
 | Crawl4AI 502 "Blocked by anti-bot protection" | Site-side; the researcher picks another source |
@@ -395,9 +434,12 @@ own logs for the other side.
 ├── doctor.py              # preflight checks for every dependency
 ├── agents/                # per-agent limits and model settings; swarm.toml for fan-out
 ├── prompts/               # per-agent instructions (Markdown)
+├── services               # start/stop/check SearXNG, Crawl4AI, docling (menu or subcommands)
+├── compose.yaml           # the Docker Compose project ./services drives
 ├── sourceMe.example       # environment template → copy to sourceMe (gitignored)
 ├── start_swarm            # uvicorn launcher for the web UI (port 8000)
 ├── show_config            # print all agent config, prompts and the current env
 ├── requirements.txt
-└── reports/               # one folder per run (gitignored, created automatically)
+├── reports/               # one folder per run (gitignored, created automatically)
+└── .services/             # ./services state: ports, token, SearXNG settings (gitignored)
 ```

@@ -16,3 +16,7 @@ debug.log
 # Local agent-tool state
 .pydantic-deep/
 .claude/
+
+# ./services state (ports, generated token, SearXNG settings)
+.services/
+sourceMe.bak

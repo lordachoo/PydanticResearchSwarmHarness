@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# Start, stop and check the swarm's support services (SearXNG, Crawl4AI,
+# docling-serve) with Docker Compose.
+#
+#   ./services                    interactive menu
+#   ./services up [svc ...]       start all, or the named services
+#   ./services down               stop and remove this project's containers
+#   ./services status             container state + HTTP health per service
+#   ./services logs <svc>         follow one service's logs
+#   ./services env                print the sourceMe lines for these services
+#   ./services write-env          put those lines into sourceMe (created from
+#                                 sourceMe.example if missing)
+#
+# Services: searxng crawl4ai docling
+# Settings (ports, bind address, Crawl4AI token, image tags) live in
+# .services/env, generated on first run. SearXNG's config is
+# .services/searxng/settings.yml. Both are gitignored.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+STATE=.services
+ENVFILE=$STATE/env
+SEARXNG_SETTINGS=$STATE/searxng/settings.yml
+ALL=(searxng crawl4ai docling)
+
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B= G= Y= R= N=; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s[ ok ]%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s[warn]%s %s\n' "$Y" "$N" "$*"; }
+err()  { printf '%s[fail]%s %s\n' "$R" "$N" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+random_string() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-48}"; }
+
+# --------------------------------------------------------------------------- #
+# Prerequisites and first-run state
+# --------------------------------------------------------------------------- #
+
+require_docker() {
+    command -v docker >/dev/null || die "docker not found. Install Docker Engine: https://docs.docker.com/engine/install/"
+    docker info >/dev/null 2>&1 || die "docker is installed but not usable by $(whoami). Start it, or: sudo usermod -aG docker \$USER (then log out/in)"
+    docker compose version >/dev/null 2>&1 || die "the docker compose plugin is missing: https://docs.docker.com/compose/install/linux/"
+}
+
+init_state() {
+    mkdir -p "$STATE/searxng"
+    if [ ! -f "$ENVFILE" ]; then
+        cat >"$ENVFILE" <<EOF
+# Settings for ./services (docker compose --env-file). Edit, then ./services up.
+# 127.0.0.1 = reachable only from this machine. Use 0.0.0.0 if the swarm runs
+# elsewhere (SearXNG and docling have no auth; keep them off untrusted networks).
+BIND_ADDR=127.0.0.1
+SEARXNG_PORT=8888
+CRAWL4AI_PORT=11235
+DOCLING_PORT=5001
+CRAWL4AI_API_TOKEN=$(random_string 48)
+# Image overrides, e.g. pin versions or use a CUDA docling build:
+# SEARXNG_IMAGE=searxng/searxng:latest
+# CRAWL4AI_IMAGE=unclecode/crawl4ai:latest
+# DOCLING_IMAGE=ghcr.io/docling-project/docling-serve:latest
+EOF
+        chmod 600 "$ENVFILE"
+        ok "created $ENVFILE (with a new Crawl4AI token)"
+    fi
+    if [ ! -f "$SEARXNG_SETTINGS" ]; then
+        cat >"$SEARXNG_SETTINGS" <<EOF
+# SearXNG settings for the swarm. Everything not set here uses SearXNG's defaults.
+use_default_settings: true
+server:
+  secret_key: "$(random_string 48)"
+  limiter: false        # the rate limiter blocks non-browser clients like the swarm
+search:
+  formats:
+    - html
+    - json              # the swarm uses the JSON API; it returns 403 without this
+EOF
+        ok "created $SEARXNG_SETTINGS"
+    fi
+    # shellcheck disable=SC1090
+    set -a; . "$ENVFILE"; set +a
+}
+
+compose() { docker compose --env-file "$ENVFILE" "$@"; }
+
+port_of() {
+    case $1 in
+        searxng) echo "$SEARXNG_PORT" ;; crawl4ai) echo "$CRAWL4AI_PORT" ;; docling) echo "$DOCLING_PORT" ;;
+    esac
+}
+image_of() {
+    case $1 in
+        searxng)  echo "${SEARXNG_IMAGE:-searxng/searxng:latest}" ;;
+        crawl4ai) echo "${CRAWL4AI_IMAGE:-unclecode/crawl4ai:latest}" ;;
+        docling)  echo "${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:latest}" ;;
+    esac
+}
+size_hint() { case $1 in searxng) echo "~400 MB" ;; crawl4ai) echo "~6 GB" ;; docling) echo "~15 GB" ;; esac; }
+url_of() { echo "http://localhost:$(port_of "$1")"; }
+
+valid_service() { local s; for s in "${ALL[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
+
+ours_running() { [ -n "$(compose ps -q --status running "$1" 2>/dev/null)" ]; }
+
+port_busy() {
+    if command -v ss >/dev/null; then
+        ss -ltnH "sport = :$1" 2>/dev/null | grep -q .
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+# Health checks
+# --------------------------------------------------------------------------- #
+
+healthy() {
+    local url; url=$(url_of "$1")
+    case $1 in
+        searxng)  curl -fsS -m 10 -o /dev/null "$url/search?q=test&format=json" ;;
+        crawl4ai) curl -fsS -m 10 -o /dev/null "$url/health" ;;
+        docling)  curl -fsS -m 10 -o /dev/null "$url/health" ;;
+    esac
+}
+
+wait_healthy() {
+    local svc=$1 i
+    for i in $(seq 1 60); do
+        healthy "$svc" 2>/dev/null && { ok "$svc healthy at $(url_of "$svc")"; return 0; }
+        sleep 3
+    done
+    warn "$svc not answering at $(url_of "$svc") after 3 min; check: ./services logs $svc"
+    return 1
+}
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+cmd_up() {
+    local want=("$@") start=() svc port
+    [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    for svc in "${want[@]}"; do valid_service "$svc" || die "unknown service '$svc' (choose from: ${ALL[*]})"; done
+
+    for svc in "${want[@]}"; do
+        port=$(port_of "$svc")
+        if ours_running "$svc"; then
+            ok "$svc already running (this project)"; start+=("$svc"); continue
+        fi
+        if port_busy "$port"; then
+            warn "$svc: port $port is already in use by something else (your own $svc?)."
+            say  "       Skipping it. Either keep using that one, or set a free port in $ENVFILE."
+            continue
+        fi
+        if ! docker image inspect "$(image_of "$svc")" >/dev/null 2>&1; then
+            say "  $svc: image $(image_of "$svc") will be downloaded ($(size_hint "$svc"))"
+        fi
+        start+=("$svc")
+    done
+    [ ${#start[@]} -eq 0 ] && { warn "nothing to start"; return 0; }
+
+    say "${B}Starting: ${start[*]}${N}"
+    compose up -d "${start[@]}"
+    for svc in "${start[@]}"; do wait_healthy "$svc" || true; done
+    say
+    say "Point the swarm at them with ${B}./services write-env${N} (updates sourceMe), or add:"
+    cmd_env "${start[@]}"
+}
+
+cmd_down() {
+    compose down
+    ok "stopped this project's services (your other containers are untouched)"
+}
+
+cmd_status() {
+    local svc state
+    printf '%-10s %-24s %-8s %s\n' SERVICE URL HTTP CONTAINER
+    for svc in "${ALL[@]}"; do
+        if ours_running "$svc"; then state="running (research-swarm)"
+        elif port_busy "$(port_of "$svc")"; then state="port in use by another process"
+        else state="not running"; fi
+        if healthy "$svc" 2>/dev/null; then h="${G}ok  ${N}"; else h="${R}down${N}"; fi
+        printf '%-10s %-24s %s     %s\n' "$svc" "$(url_of "$svc")" "$h" "$state"
+    done
+}
+
+cmd_logs() {
+    [ $# -eq 1 ] && valid_service "$1" || die "usage: ./services logs <${ALL[*]// /|}>"
+    compose logs -f --tail 100 "$1"
+}
+
+env_lines() {
+    local svc
+    for svc in "$@"; do
+        case $svc in
+            searxng)  echo "SEARXNG_URL=$(url_of searxng)" ;;
+            crawl4ai) echo "CRAWL4AI_URL=$(url_of crawl4ai)"; echo "CRAWL4AI_API_TOKEN=$CRAWL4AI_API_TOKEN" ;;
+            docling)  echo "DOCLING_URL=$(url_of docling)" ;;
+        esac
+    done
+}
+
+cmd_env() {
+    local want=("$@"); [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    env_lines "${want[@]}" | sed 's/^\([^=]*\)=\(.*\)/    export \1="\2"/'
+}
+
+cmd_write_env() {
+    local want=("$@") line key val
+    [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    if [ ! -f sourceMe ]; then
+        cp sourceMe.example sourceMe
+        ok "created sourceMe from sourceMe.example (set LLM_BASE_URL and LLM_MODEL in it)"
+    fi
+    cp sourceMe sourceMe.bak
+    while IFS= read -r line; do
+        key=${line%%=*}; val=${line#*=}
+        if grep -qE "^[[:space:]]*export[[:space:]]+$key=" sourceMe; then
+            sed -i -E "s|^[[:space:]]*export[[:space:]]+$key=.*|export $key=\"$val\"|" sourceMe
+        else
+            printf 'export %s="%s"\n' "$key" "$val" >>sourceMe
+        fi
+    done < <(env_lines "${want[@]}")
+    ok "updated sourceMe for: ${want[*]} (previous version: sourceMe.bak). Run: source sourceMe"
+}
+
+# --------------------------------------------------------------------------- #
+# Menu
+# --------------------------------------------------------------------------- #
+
+pick_services() {
+    local ans s picked=()
+    say "Which services? (space-separated numbers, Enter = all)" >&2
+    local i=1; for s in "${ALL[@]}"; do say "  $i) $s  ($(size_hint "$s") image)" >&2; i=$((i + 1)); done
+    read -rp "> " ans
+    [ -z "$ans" ] && { echo "${ALL[*]}"; return; }
+    for i in $ans; do
+        [[ $i =~ ^[1-3]$ ]] && picked+=("${ALL[$((i - 1))]}") || { warn "ignoring '$i'" >&2; }
+    done
+    echo "${picked[*]}"
+}
+
+menu() {
+    local choice svcs
+    while true; do
+        say
+        say "${B}Research swarm services${N}  (settings: $ENVFILE, bind ${BIND_ADDR})"
+        cmd_status
+        say
+        say "  1) Start services        4) Follow logs"
+        say "  2) Stop all              5) Show sourceMe lines"
+        say "  3) Refresh status        6) Write them into sourceMe"
+        say "  q) Quit"
+        read -rp "> " choice || exit 0
+        case $choice in
+            1) svcs=$(pick_services); [ -n "$svcs" ] && read -ra arr <<<"$svcs" && cmd_up "${arr[@]}" ;;
+            2) cmd_down ;;
+            3) ;;
+            4) read -rp "Service (${ALL[*]}): " svcs; cmd_logs "$svcs" || true ;;
+            5) cmd_env ;;
+            6) cmd_write_env ;;
+            q|Q|"") exit 0 ;;
+            *) warn "unknown choice '$choice'" ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------------------- #
+
+require_docker
+init_state
+
+case ${1:-} in
+    "")        if [ -t 0 ]; then menu; else sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; fi ;;
+    up)        shift; cmd_up "$@" ;;
+    down)      cmd_down ;;
+    status)    cmd_status ;;
+    logs)      shift; cmd_logs "$@" ;;
+    env)       shift; cmd_env "$@" ;;
+    write-env) shift; cmd_write_env "$@" ;;
+    -h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)         die "unknown command '$1' (try ./services help)" ;;
+esac
