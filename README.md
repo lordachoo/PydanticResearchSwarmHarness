@@ -168,6 +168,9 @@ server instead of being enforced.
 | `max_workers` | 4 | Concurrent researchers. Keep ≤ the server's parallel slots (vLLM `--max-num-seqs`, llama.cpp `--parallel`) |
 | `min_subquestions` / `max_subquestions` | 1 / 5 | Bounds on the planner's plan |
 | `output_retries` | 3 | Retries when structured output fails to parse or validate |
+| `preflight` | `true` | Check SearXNG and Crawl4AI before a run; abort if either is down or rejects its token |
+| `finalize_on_failure` | `true` | A failed researcher first retries just its answer from the pages it already read |
+| `researcher_retries` | 1 | Then re-runs only that researcher from scratch, up to this many times |
 
 **`agents/researcher.toml`**
 
@@ -177,7 +180,7 @@ server instead of being enforced.
 | `request_limit` | 55 | Model calls per researcher (each tool round costs 1) |
 | `timeout_s` | 900 | Wall-clock cap per researcher |
 | `max_searches` | 25 | `web_search` budget |
-| `max_fetches` / `min_fetches` | 10 / 2 | `fetch_page` budget / minimum before an answer is accepted |
+| `max_fetches` / `min_fetches` | 10 / 2 | `fetch_page` attempts allowed / pages that must have been read successfully before an answer is accepted |
 | `page_char_limit` | 10000 | Characters kept per HTML page |
 | `pdf_page_limit` / `pdf_char_limit` | 100 / 40000 | Pages converted / characters kept per PDF |
 | `[model_settings]` | `temperature = 0.3`, `max_tokens = 16384` | Sent to the model |
@@ -246,9 +249,12 @@ pydantic-ai defaults that break local servers:
 The model will happily answer from memory and cite URLs it never opened. These
 guards stop that:
 
-- **Output validator.** A `Finding` is rejected and sent back if fewer than
-  `min_fetches` pages were fetched, if any listed source wasn't fetched by
-  that researcher, or if sources are empty.
+- **Output validator.** Only pages that actually returned content count as
+  read; a fetch that failed (401, 502, empty page) doesn't. A `Finding` is
+  sent back if fewer than `min_fetches` pages were read, or if none of its
+  sources were read. Sources that weren't read are removed from an otherwise
+  valid answer, not grounds for rejecting it, so one bad citation can't sink
+  the answer. Every listed source was still read by that researcher.
 - **Tool guards.** `fetch_page` refuses search-result URLs and repeat fetches,
   and both tools enforce their budgets. Each refusal is returned to the model
   as an instruction, so it changes course instead of crashing.
@@ -261,14 +267,23 @@ guards stop that:
 
 ### 4.3 Failure handling
 
+A failure costs the smallest piece of work that can be redone, never the whole
+run.
+
 | Failure | What happens |
 |---|---|
+| SearXNG or Crawl4AI down or misconfigured, found **before** the run | **Preflight** (search + one fetch, cached 5 min) aborts in about a second, before any tokens are spent. The message names the service and the fix |
+| The same, found **during** the run (Crawl4AI rejects its token, a service stops answering) | The run aborts at the first occurrence and every researcher is cancelled at once. Nothing keeps burning tokens on a dead service |
 | Planner fails (timeout, invalid output after retries, server error) | One researcher is run on the whole task |
-| A researcher fails or times out | Its finding says so; the writer reports that sub-question as unanswered |
+| A researcher fails (invalid output after retries, request limit, model error, timeout) | **Only that researcher** is retried; the others' results are kept. (1) *Finalize*: if it read any pages, its own conversation is continued, with those pages still in context, and asked only for the answer (fresh retry budget, ≤4 requests). (2) If that fails, it is re-run from scratch up to `researcher_retries` times, told why the last attempt failed. (3) Only then is its sub-question reported as unanswered, with the reason |
 | Writer fails | The raw findings become the report, with a note at the top |
-| A fetch or search fails | The error text goes back to the model, which picks another source |
+| A single fetch or search fails | The error text goes back to the model, which picks another source |
+| The report has gaps | The orchestrator can call `run_research` at most once per user message (enforced in code), so it can't re-run the whole swarm on its own. Ask a follow-up if you want more |
 
-The run is always saved to `reports/`, even if every agent fails.
+The run is saved to `reports/` whenever it reaches the end, even if every
+agent failed. An aborted run (dead service) stops before saving and says why.
+The progress page shows retries as `retrying` with an attempt counter (`R2 ×2`)
+and the rejection reason in the event log.
 
 ---
 
@@ -280,8 +295,11 @@ hour. Two complementary views show what's happening inside it.
 ### 5.1 Live progress page
 
 Open **`http://<host>:8000/progress`** next to the chat. The orchestrator also
-posts the link when it starts a run. The page updates live (Server-Sent Events)
-and shows, for each run:
+posts the link when it starts a run.
+
+![Live progress page: a five-researcher run in progress, showing each stage's status, sub-question, current activity, search and fetch budgets, requests, tokens and elapsed time](docs/PydanticResearchHarnessProgress00.png)
+
+The page updates live (Server-Sent Events) and shows, for each run:
 
 - **Run summary:** status, elapsed time, total model requests, input and
   output tokens, searches and fetches.
@@ -372,7 +390,7 @@ the Compose plugin. Run it with no arguments for a menu, or use subcommands:
 | `./services status` | Container state and an HTTP health check per service |
 | `./services logs <service>` | Follow a service's logs |
 | `./services env` | Print the `sourceMe` lines for these services (Phoenix's only while it's running) |
-| `./services write-env` | Write those lines into `sourceMe` (created from `sourceMe.example` if missing; old copy kept as `sourceMe.bak`) |
+| `./services write-env` | Write those lines into `sourceMe` (created from `sourceMe.example` if missing; old copy kept as `sourceMe.bak`). Only services `./services` is running are written, so values for your own instances are never touched |
 | `./services down` | Stop and remove this project's containers |
 
 On first run it creates these files (both gitignored):
@@ -497,7 +515,7 @@ Start with `python doctor.py`. Most problems show up as a FAIL line there.
 | `401` / `403` from the LLM | Server checks keys; set `LLM_API_KEY` |
 | `structured response_format with tools/MCP is not supported` | Something is in `native` mode on a server that refuses `response_format` + tools. Use `prompted` (the default); check `LLM_OUTPUT_MODE` |
 | `System message must be at the beginning` | A second system message is being sent. The model profile merges them; check you haven't added `@agent.instructions` / `system_prompt` on a separately built model |
-| `Exceeded maximum output retries` | Check which agent in the terminal. Usually a thinking model hitting `max_tokens` (`content: null`, `finish_reason: length`): raise `max_tokens`. Otherwise bad JSON in `prompted` mode, or a researcher refusing to fetch (validator rejection) |
+| `Exceeded maximum output retries` | The log line includes `last rejection: …` with the validator's or parser's actual complaint. Common causes: a thinking model hitting `max_tokens` (`content: null`, `finish_reason: length`), so raise `max_tokens`; prose instead of JSON in `prompted` mode; or too few pages read. A researcher hitting this is retried automatically (§4.3) |
 | `grammar_matcher.cc … accept new token` (vLLM log) | `tool` output mode on vLLM + Qwen; use `prompted` or `native` |
 | Researcher finishes with no tool calls / prints tool-call text | Server isn't parsing tool calls: vLLM `--enable-auto-tool-choice --tool-call-parser …`, llama.cpp `--jinja` |
 | `[planner] FAILED …; falling back` | Planner couldn't produce a valid plan; the run continues with one researcher. Look at the error; often `max_tokens` or a weak model in `prompted` mode |
@@ -508,7 +526,7 @@ Start with `python doctor.py`. Most problems show up as a FAIL line there.
 | `./services`: "docker is installed but not usable" | Start Docker, or add yourself to the `docker` group and log in again |
 | Can't edit SearXNG `settings.yml` (owned by uid 977) | The config directory was mounted; mount just the file read-only (see §6.2) |
 | SearXNG returns 0 results | Upstream engines are rate-limiting you; check `/stats` |
-| Crawl4AI `401` | `CRAWL4AI_API_TOKEN` doesn't match the container's |
+| `Crawl4AI rejected CRAWL4AI_API_TOKEN (HTTP 401)` / run aborted | The token in `sourceMe` doesn't match the container's (`docker inspect <container>` shows its env). Fix `sourceMe`, then **restart** `./start_swarm`: `--reload` re-imports code but keeps the old environment |
 | Crawl4AI 502 "Blocked by anti-bot protection" | Site-side; the researcher picks another source |
 | `PDF FETCH FAILED … no md_content` | docling-serve's response shape differs; the error lists the keys it got |
 | `/progress` is empty during a CLI run | The tracker lives in the web server process; CLI runs show progress in the terminal and save `metrics.json` |
