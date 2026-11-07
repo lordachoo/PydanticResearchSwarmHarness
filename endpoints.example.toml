@@ -1,0 +1,49 @@
+# LLM endpoint profiles. Copy to endpoints.toml (gitignored) and edit:
+#     cp endpoints.example.toml endpoints.toml
+# Without endpoints.toml the swarm uses one profile built from LLM_BASE_URL,
+# LLM_MODEL and LLM_API_KEY. This file is re-read at the start of every run;
+# only the orchestrator's assignment needs a server restart.
+#
+# Values may use ${ENV_VAR} or ${ENV_VAR:-default}, so URLs and keys can stay
+# in sourceMe. Check every profile with: python doctor.py
+
+# ---------------------------------------------------------------------------
+# Profiles: one per endpoint (or per model on an endpoint)
+# ---------------------------------------------------------------------------
+
+[profiles.local]
+provider = "openai"                     # any OpenAI-compatible server
+base_url = "${LLM_BASE_URL}"            # must end in /v1
+model = "${LLM_MODEL}"                  # id as the server's /v1/models lists it
+api_key = "${LLM_API_KEY:-local}"
+max_concurrency = 4                     # agents it serves at once (vLLM --max-num-seqs, llama.cpp --parallel)
+# output_mode = "prompted"              # prompted | native | tool; overrides the agent tomls for this endpoint
+# merge_system_messages = true          # one system message per request (Qwen chat templates need it)
+# json_object_output = false            # allow response_format json_object in prompted mode
+
+# A second machine on your tailnet/VPN, e.g. a faster model for researchers:
+# [profiles.fast]
+# provider = "openai"
+# base_url = "http://<other-host>:8080/v1"
+# model = "qwen3.6-35b-a3b"
+# max_concurrency = 6
+
+# Claude (Anthropic API). Needs ANTHROPIC_API_KEY in the environment. Hosted
+# models are billed per token: a large run can be several hundred thousand.
+# [profiles.claude]
+# provider = "anthropic"
+# model = "claude-sonnet-5-5"
+# api_key = "${ANTHROPIC_API_KEY}"
+# max_concurrency = 4
+# output_mode = "tool"                  # Claude handles tool-call output well
+
+# ---------------------------------------------------------------------------
+# Which profile each agent uses
+# ---------------------------------------------------------------------------
+
+[agents]
+orchestrator = "local"                  # web chat agent (restart to change)
+planner = "local"
+researcher = ["local"]                  # a pool, e.g. ["local", "fast"]: each researcher takes
+                                        # the least-busy endpoint with a free slot
+writer = "local"

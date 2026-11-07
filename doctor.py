@@ -140,8 +140,15 @@ def check_searxng(http: httpx.Client) -> None:
     elif r.status_code != 200:
         report(False, "SearXNG", f"HTTP {r.status_code}")
     else:
-        n = len(r.json().get("results", []))
-        report(n > 0 or None, "SearXNG", f"{n} results for 'test'" + ("" if n else " (engines may be blocked; see /stats)"))
+        data = r.json()
+        n = len(data.get("results", []))
+        bad = ", ".join(f"{e[0]}: {e[1]}" for e in data.get("unresponsive_engines", []) if len(e) > 1)
+        if n:
+            report(True, "SearXNG", f"{n} results for 'test'" + (f" (some engines failing: {bad})" if bad else ""))
+        else:
+            report(False, "SearXNG", "0 results for a generic query; the swarm will refuse to run. "
+                   + (f"Upstream engines failing: {bad}. " if bad else "")
+                   + "Wait for rate limits to clear or enable other engines (see /stats)")
 
 
 def check_crawl4ai(http: httpx.Client) -> None:
@@ -201,16 +208,62 @@ def check_tracing(http: httpx.Client) -> None:
         report(False, "tracing packages", "missing; pip install -r requirements.txt")
 
 
+def check_anthropic(http: httpx.Client, key: str, model: str) -> None:
+    try:
+        r = http.get("https://api.anthropic.com/v1/models", timeout=20,
+                     headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+    except httpx.HTTPError as e:
+        report(False, "Anthropic API reachable", str(e))
+        return
+    if r.status_code in (401, 403):
+        report(False, "Anthropic API key", f"HTTP {r.status_code}: key rejected")
+        return
+    if r.status_code != 200:
+        report(False, "Anthropic API", f"HTTP {r.status_code}: {r.text[:200]}")
+        return
+    ids = {m.get("id") for m in r.json().get("data", [])}
+    report(True if model in ids else None, "Anthropic model",
+           model if model in ids else f"{model!r} not in the key's model list (aliases may still work)")
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        report(False, "Anthropic SDK", "missing; pip install anthropic")
+
+
+def check_endpoints(http: httpx.Client) -> None:
+    """Every profile some agent uses (endpoints.toml, or LLM_* env)."""
+    global LLM, MODEL, KEY
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import endpoints
+        eps = endpoints.load()
+    except Exception as e:
+        report(False, "endpoints.toml", str(e))
+        return
+    used = {n for names in eps.agents.values() for n in names}
+    print(f"\nLLM endpoints ({eps.source}):")
+    for role, names in eps.agents.items():
+        print(f"  {role:<12} → {', '.join(names)}")
+    for name in sorted(used):
+        p = eps.profiles[name]
+        print(f"\n--- profile {name}: {p.model} @ {p.base_url if p.provider == 'openai' else p.provider}"
+              f" (max_concurrency {p.max_concurrency}{', output_mode ' + p.output_mode if p.output_mode else ''})")
+        if p.provider == "anthropic":
+            check_anthropic(http, p.api_key, p.model)
+            continue
+        LLM, MODEL, KEY = p.base_url.rstrip("/"), p.model, p.api_key
+        check_llm(http)
+
+
 def main() -> int:
-    print(f"LLM      {LLM}  model={MODEL}")
     print(f"SearXNG  {SEARXNG}\nCrawl4AI {CRAWL4AI}\ndocling  {DOCLING}")
-    print(f"LLM_OUTPUT_MODE={os.environ.get('LLM_OUTPUT_MODE') or '(unset: tomls decide)'}\n")
+    print(f"LLM_OUTPUT_MODE={os.environ.get('LLM_OUTPUT_MODE') or '(unset: endpoints/tomls decide)'}\n")
     with httpx.Client() as http:
         check_searxng(http)
         check_crawl4ai(http)
         check_docling(http)
         check_tracing(http)
-        check_llm(http)
+        check_endpoints(http)
     print("\n" + ("Problems found; fix the FAIL lines above." if failed else "Ready."))
     return 1 if failed else 0
 

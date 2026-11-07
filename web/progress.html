@@ -36,7 +36,14 @@
   .meta b { color: var(--text); font-weight: 600; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
           text-transform: uppercase; letter-spacing: .03em; border: 1px solid currentColor; white-space: nowrap; }
-  .s-running { color: var(--run); } .s-done { color: var(--ok); } .s-failed, .s-timeout { color: var(--bad); }
+  .s-running { color: var(--run); } .s-done { color: var(--ok); } .s-failed, .s-timeout, .s-aborted { color: var(--bad); }
+  .s-retrying, .s-partial { color: var(--warn); }
+  .fail { color: var(--bad); font-size: 11px; margin-left: 4px; }
+  .att { color: var(--warn); font-size: 11px; margin-left: 4px; font-weight: 600; }
+  .prof { display: block; color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 2px; }
+  .since { color: var(--muted); }
+  .eps { font-size: 12px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+  .eps b { color: var(--text); font-weight: 600; }
   .s-pending, .s-skipped { color: var(--idle); }
   .body { border-top: 1px solid var(--line); }
   .tablewrap { overflow-x: auto; }
@@ -46,6 +53,7 @@
   td.num, th.num { text-align: right; white-space: nowrap; }
   td.key { font-family: var(--mono); font-weight: 600; white-space: nowrap; }
   td.label { max-width: 340px; }
+  td.label div { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
   td.act { font-family: var(--mono); font-size: 12px; color: var(--muted); max-width: 420px; word-break: break-word; }
   td.act.err { color: var(--bad); }
   .bar { display: inline-block; width: 46px; height: 5px; background: var(--line); border-radius: 3px; vertical-align: middle; margin-left: 6px; overflow: hidden; }
@@ -60,6 +68,23 @@
   .log .m { word-break: break-word; }
   .foot { padding: 8px 16px 12px; font-size: 12px; color: var(--muted); }
   code { font-family: var(--mono); font-size: 12px; }
+  .btn { font: 600 11px/1 system-ui, sans-serif; padding: 5px 9px; border-radius: 6px; cursor: pointer;
+         border: 1px solid var(--line); background: var(--panel); color: var(--text); white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .btn:disabled { opacity: .5; cursor: wait; }
+  td.actions { white-space: nowrap; text-align: right; }
+  td.actions .btn + .btn { margin-left: 4px; }
+  .bar-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 10px 16px;
+                 border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+  .bar-actions .sp { flex: 1; }
+  .bar-actions a { color: var(--accent); text-decoration: none; }
+  .job { color: var(--warn); font-weight: 600; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 32px);
+           background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: 8px; font-size: 13px;
+           opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 5; }
+  #toast.show { opacity: .95; }
+  #toast.err { background: var(--bad); color: #fff; }
   @media (max-width: 640px) {
     header, main { padding-left: 16px; padding-right: 16px; }
     td.label { max-width: 200px; }
@@ -70,9 +95,11 @@
 <header>
   <h1>Research swarm: live progress</h1>
   <a href="/">← chat</a>
+  <span class="eps" id="eps"></span>
   <span class="conn"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
 </header>
 <main id="runs"><div class="empty">No runs yet. Ask the chat a research question.</div></main>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
 const runsEl = document.getElementById("runs");
@@ -103,20 +130,63 @@ function isOpen(run, i) {
   return run.status === "running" || i === 0;
 }
 
+const btn = (label, act, data = {}, cls = "", title = "") =>
+  `<button class="btn ${cls}" data-act="${act}" ${Object.entries(data).map(([k, v]) => `data-${k}="${esc(v)}"`).join(" ")} title="${esc(title)}">${label}</button>`;
+const live = st => ["pending", "running", "retrying"].includes(st.status);
+
+function stageActions(run, st) {
+  if (!run.controllable) return "";
+  const isR = /^R\d+$/.test(st.key), id = run.run_id;
+  if (run.status === "running") {
+    if (!live(st)) return "";
+    if (!isR || st.status === "pending") return btn("Stop", "stage", {run: id, key: st.key, cmd: "stop"}, "danger",
+      isR ? "Skip this sub-question" : st.key === "writer" ? "Stop the writer; the raw findings become the report" : "Stop planning; one researcher takes the whole task");
+    return (st.finalizing ? "" : btn("Finalize", "stage", {run: id, key: st.key, cmd: "finalize"}, "", "Stop researching and answer from the pages already read"))
+      + btn("Restart", "stage", {run: id, key: st.key, cmd: "restart"}, "", "Abandon this attempt and start this researcher over")
+      + btn("Stop", "stage", {run: id, key: st.key, cmd: "stop"}, "danger", "Give up on this sub-question");
+  }
+  if (isR && !run.job) return btn("Re-run", "rerun", {run: id, key: st.key}, "", "Research this sub-question again, then rewrite the report")
+    + btn("Edit…", "edit", {run: id, key: st.key, q: st.label}, "", "Change the sub-question, research it, then rewrite the report");
+  if (st.key === "writer" && !run.job) return btn("Re-run", "rewrite", {run: id}, "", "Run the writer again on the current findings (the current report is kept as an earlier version)");
+  return "";
+}
+
+function runActions(run) {
+  const id = run.run_id, parts = [];
+  if (!run.controllable) {
+    parts.push(`<span>Controls unavailable: this run is from before the server restarted.</span>`);
+  } else if (run.status === "running") {
+    if (run.job) parts.push(`<span class="job">${esc(run.job)}…</span>`);
+    if (run.phase === "researching" && !run.job) parts.push(btn("Wrap up", "wrapup", {run: id}, "", "Running researchers answer from what they've read, queued ones are skipped, then the writer runs"));
+    parts.push(btn(run.job ? "Stop job" : "Abort run", "abort", {run: id}, "danger", "Stop now; finished work is saved"));
+  } else {
+    parts.push(btn("Rewrite report", "rewrite", {run: id}, "", "Run the writer again on the current findings"));
+    parts.push(btn("Add sub-question…", "add", {run: id}, "", "Research one more sub-question, then rewrite the report"));
+  }
+  parts.push(`<span class="sp"></span>`);
+  if (run.report_dir) {
+    parts.push(`<a href="/progress/report/${encodeURIComponent(id)}" target="_blank" rel="noopener">View report</a>`);
+    for (let v = run.report_versions; v >= 1; v--)
+      parts.push(`<a href="/progress/report/${encodeURIComponent(id)}?v=${v}" target="_blank" rel="noopener" title="earlier version">v${v}</a>`);
+  }
+  return `<div class="bar-actions">${parts.join("")}</div>`;
+}
+
 function renderRun(run, i) {
   const t = run.totals;
   const rows = run.stages.map(st => {
     const act = st.error ? st.error : st.activity;
     return `<tr>
-      <td class="key">${esc(st.key)}</td>
+      <td class="key">${esc(st.key)}${st.attempts > 1 ? `<span class="att" title="attempt ${st.attempts}">×${st.attempts}</span>` : ""}${st.profile ? `<span class="prof" title="endpoint profile">${esc(st.profile)}</span>` : ""}</td>
       <td>${pill(st.status)}</td>
-      <td class="label" title="${esc(st.label)}">${esc(st.label)}</td>
-      <td class="act ${st.error ? "err" : ""}">${esc(act)}</td>
+      <td class="label" title="${esc(st.label)}"><div>${esc(st.label)}</div></td>
+      <td class="act ${st.error ? "err" : ""}">${esc(act)}${!st.error && st.activity && st.activity_since && live(st) ? ` <span class="since" data-start="${st.activity_since}" data-end="">${dur(st.activity_since, null)}</span>` : ""}</td>
       <td class="num">${st.max_searches ? budget(st.searches, st.max_searches) : "–"}</td>
-      <td class="num">${st.max_fetches ? budget(st.fetches, st.max_fetches) : "–"}</td>
+      <td class="num">${st.max_fetches ? budget(st.fetches, st.max_fetches) : "–"}${st.fetch_failures ? `<span class="fail" title="fetches that returned an error">${st.fetch_failures} failed</span>` : ""}</td>
       <td class="num">${st.requests || "–"}</td>
       <td class="num">${fmtK(st.input_tokens)} / ${fmtK(st.output_tokens)}</td>
       <td class="num" data-start="${st.started || ""}" data-end="${st.ended || ""}">${dur(st.started, st.ended)}</td>
+      <td class="actions">${stageActions(run, st)}</td>
     </tr>`;
   }).join("");
   const events = run.events.map(e =>
@@ -131,14 +201,15 @@ function renderRun(run, i) {
         <span><b data-start="${run.started}" data-end="${run.ended || ""}">${dur(run.started, run.ended)}</b> elapsed</span>
         <span><b>${fmtN(t.requests)}</b> model requests</span>
         <span><b>${fmtK(t.input_tokens)}</b> in / <b>${fmtK(t.output_tokens)}</b> out tokens</span>
-        <span><b>${t.searches}</b> searches · <b>${t.fetches}</b> fetches</span>
+        <span><b>${t.searches}</b> searches · <b>${t.fetches}</b> pages read${t.fetch_failures ? ` · <b class="fail">${t.fetch_failures}</b> fetches failed` : ""}</span>
       </span>
     </summary>
     <div class="body">
+      ${runActions(run)}
       <div class="tablewrap"><table>
         <thead><tr><th>Stage</th><th>Status</th><th>Working on</th><th>Activity</th>
-          <th class="num">Searches</th><th class="num">Fetches</th><th class="num">Requests</th>
-          <th class="num">Tokens in / out</th><th class="num">Time</th></tr></thead>
+          <th class="num">Searches</th><th class="num">Pages read</th><th class="num">Requests</th>
+          <th class="num">Tokens in / out</th><th class="num">Time</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
       ${run.events.length ? `<details class="log" data-log="${esc(run.run_id)}" ${logOpen}>
@@ -148,7 +219,26 @@ function renderRun(run, i) {
   </details>`;
 }
 
+// Re-rendering replaces the buttons; doing that between mousedown and mouseup
+// loses the click. Hold updates while the pointer is on a button.
+let holding = false, pending = null;
+runsEl.addEventListener("pointerover", e => { if (e.target.closest("button")) holding = true; });
+runsEl.addEventListener("pointerout", e => {
+  if (!e.target.closest("button") || (e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest("button"))) return;
+  holding = false;
+  if (pending) { const p = pending; pending = null; render(p); }
+});
+
+function renderEndpoints(eps) {
+  const el = document.getElementById("eps");
+  const names = Object.keys(eps || {});
+  el.innerHTML = names.length ? names.map(n =>
+    `<span title="agents using this endpoint now / its max_concurrency"><b>${esc(n)}</b> ${eps[n].in_use}/${eps[n].limit}</span>`).join("") : "";
+}
+
 function render(snap) {
+  if (holding) { pending = snap; return; }
+  renderEndpoints(snap.endpoints);
   last = snap;
   if (!snap.runs.length) { runsEl.innerHTML = `<div class="empty">No runs yet. Ask the chat a research question.</div>`; return; }
   // Keep each open log scrolled to the bottom if it already was.
@@ -174,6 +264,61 @@ runsEl.addEventListener("toggle", e => {
     d.open ? openLogs.add(d.dataset.log) : openLogs.delete(d.dataset.log);
   }
 }, true);
+
+// ---- controls ----
+let toastTimer;
+function toast(msg, err = false) {
+  const el = document.getElementById("toast");
+  el.textContent = msg; el.className = "show" + (err ? " err" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.className = "", err ? 6000 : 3000);
+}
+
+async function control(runId, action, body, button) {
+  if (button) button.disabled = true;
+  try {
+    const r = await fetch(`/progress/api/${encodeURIComponent(runId)}/${action}`, {
+      method: "POST", headers: {"Content-Type": "application/json", "X-Swarm-Control": "1"},
+      body: JSON.stringify(body || {}),
+    });
+    const j = await r.json().catch(() => ({}));
+    r.ok ? toast(j.message || "done") : toast(j.error || `HTTP ${r.status}`, true);
+  } catch (e) {
+    toast(`request failed: ${e}`, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+const CONFIRM = {
+  stop: "Stop {key}? Its sub-question will be reported as not answered.",
+  restart: "Restart {key}? Its current attempt is thrown away.",
+  abort: "Abort? Running work stops now; finished findings are saved.",
+};
+
+runsEl.addEventListener("click", e => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  e.preventDefault();
+  const d = b.dataset, act = d.act;
+  if (act === "stage") {
+    const q = CONFIRM[d.cmd];
+    if (q && !confirm(q.replace("{key}", d.key))) return;
+    control(d.run, "stage", {key: d.key, cmd: d.cmd}, b);
+  } else if (act === "abort") {
+    if (confirm(CONFIRM.abort)) control(d.run, "abort", {}, b);
+  } else if (act === "wrapup" || act === "rewrite") {
+    control(d.run, act, {}, b);
+  } else if (act === "rerun") {
+    if (confirm(`Re-run ${d.key}, then rewrite the report? The current report is kept as an earlier version.`))
+      control(d.run, "rerun", {key: d.key}, b);
+  } else if (act === "edit") {
+    const q = prompt(`Edit ${d.key}'s sub-question, then research it again:`, d.q);
+    if (q && q.trim()) control(d.run, "rerun", {key: d.key, subquestion: q.trim()}, b);
+  } else if (act === "add") {
+    const q = prompt("New sub-question to research (the report is rewritten afterwards):");
+    if (q && q.trim()) control(d.run, "add", {subquestion: q.trim()}, b);
+  }
+});
 
 // Tick elapsed times between updates.
 setInterval(() => {

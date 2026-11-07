@@ -1,7 +1,9 @@
 # Writer: synthesizes all findings into the final answer.
 prompt = "writer"
 request_limit = 5
-timeout_s = 900
+timeout_s = 1800            # wall-clock cap per run of this agent (30 min); waiting for a free endpoint not counted
+
+stream = true               # stream model output so the progress page shows it growing
 
 [model_settings]
 temperature = 0.4

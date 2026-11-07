@@ -3,3 +3,14 @@ max_workers = 4             # concurrent researchers; keep <= vLLM --max-num-seq
 min_subquestions = 1
 max_subquestions = 5
 output_retries = 3          # structured-output validation retries per agent
+
+# Resilience
+preflight = true            # check SearXNG + Crawl4AI before spending tokens; abort on bad token / dead service
+finalize_on_failure = true  # a failed researcher first retries just its answer, from pages it already read
+researcher_retries = 1      # then re-runs only that researcher from scratch, up to this many times
+searxng_dead_after = 3      # consecutive empty searches with failing upstream engines before the run aborts
+
+# Search (shared by all researchers; see search.py)
+searxng_categories = "general"   # SearXNG categories to query, e.g. "general,news" or "general,news,science"
+search_cache_hours = 24          # reuse results for identical queries for this long (0 = off)
+search_min_interval_s = 1.5      # minimum gap between requests to SearXNG, process-wide

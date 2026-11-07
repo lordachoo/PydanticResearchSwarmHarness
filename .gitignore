@@ -5,6 +5,8 @@ __pycache__/
 
 # Local config with endpoints and tokens: copy sourceMe.example -> sourceMe
 sourceMe
+sourceMe.*
+!sourceMe.example
 .env
 .env.*
 
@@ -20,3 +22,9 @@ debug.log
 # ./services state (ports, generated token, SearXNG settings)
 .services/
 sourceMe.bak
+
+# Search result cache (search.py)
+.cache/
+
+# LLM endpoint profiles (may hold URLs and keys): copy endpoints.example.toml
+endpoints.toml

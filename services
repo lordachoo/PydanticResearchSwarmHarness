@@ -8,9 +8,12 @@
 #   ./services down               stop and remove this project's containers
 #   ./services status             container state + HTTP health per service
 #   ./services logs <svc>         follow one service's logs
-#   ./services env                print the sourceMe lines for these services
+#   ./services env                print the sourceMe lines for the services
+#                                 this project is running
 #   ./services write-env          put those lines into sourceMe (created from
-#                                 sourceMe.example if missing)
+#                                 sourceMe.example if missing). Services it is
+#                                 not running are never written, so your own
+#                                 instances' URLs and tokens are left alone.
 #
 # Core services: searxng crawl4ai docling
 # Optional:      phoenix  (trace viewer for OpenTelemetry; see tracing.py)
@@ -215,12 +218,24 @@ cmd_logs() {
     compose logs -f --tail 100 "$1"
 }
 
-# Core services always; phoenix only when it is running, since pointing the
-# swarm at an absent collector just produces export warnings.
+# Only services this compose project is running. Writing values for a service
+# we didn't start (e.g. port taken by the user's own Crawl4AI) would replace
+# their working URL/token with ours, which nothing is listening for.
 default_env_services() {
-    local s=("${CORE[@]}")
-    ours_running phoenix && s+=(phoenix)
-    echo "${s[*]}"
+    local s out=()
+    for s in "${ALL[@]}"; do ours_running "$s" && out+=("$s"); done
+    echo "${out[*]}"
+}
+
+# Keep only requested services that are ours and running; warn about the rest.
+running_only() {
+    local s out=()
+    for s in "$@"; do
+        valid_service "$s" || die "unknown service '$s' (choose from: ${ALL[*]})"
+        if ours_running "$s"; then out+=("$s")
+        else warn "$s is not running from ./services; leaving its sourceMe values alone" >&2; fi
+    done
+    echo "${out[*]}"
 }
 
 env_lines() {
@@ -237,13 +252,16 @@ env_lines() {
 }
 
 cmd_env() {
-    local want=("$@"); [ ${#want[@]} -eq 0 ] && read -ra want <<<"$(default_env_services)"
+    local want=()
+    if [ $# -eq 0 ]; then read -ra want <<<"$(default_env_services)"; else read -ra want <<<"$(running_only "$@")"; fi
+    [ ${#want[@]} -eq 0 ] && { warn "no services running from ./services; nothing to print"; return 0; }
     env_lines "${want[@]}" | sed 's/^\([^=]*\)=\(.*\)/    export \1="\2"/'
 }
 
 cmd_write_env() {
-    local want=("$@") line key val
-    [ ${#want[@]} -eq 0 ] && read -ra want <<<"$(default_env_services)"
+    local want=() line key val
+    if [ $# -eq 0 ]; then read -ra want <<<"$(default_env_services)"; else read -ra want <<<"$(running_only "$@")"; fi
+    [ ${#want[@]} -eq 0 ] && { warn "no services running from ./services; sourceMe not changed"; return 0; }
     if [ ! -f sourceMe ]; then
         cp sourceMe.example sourceMe
         ok "created sourceMe from sourceMe.example (set LLM_BASE_URL and LLM_MODEL in it)"

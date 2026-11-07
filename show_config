@@ -39,6 +39,26 @@ for toml in agents/*.toml; do
 done
 
 rule
+echo "LLM ENDPOINTS  (endpoints.toml, or LLM_* env if it doesn't exist; keys masked)"
+rule
+PYBIN=.venv/bin/python; [ -x "$PYBIN" ] || PYBIN=python3
+"$PYBIN" - <<'PY'
+import endpoints
+try:
+    e = endpoints.load()
+except Exception as err:
+    print("ERROR:", err); raise SystemExit
+print("source:", e.source)
+for p in e.profiles.values():
+    m = p.masked()
+    print(f"  {p.name}: provider={m['provider']} model={m['model']} base_url={m['base_url'] or '-'} "
+          f"api_key={m['api_key']} max_concurrency={m['max_concurrency']} output_mode={m['output_mode'] or '(agent toml)'}")
+for role, names in e.agents.items():
+    print(f"  {role:<12} -> {', '.join(names)}")
+PY
+echo
+
+rule
 echo "ENVIRONMENT  (current shell)"
 rule
 for v in LLM_BASE_URL LLM_MODEL CRAWL4AI_URL SEARXNG_URL DOCLING_URL LLM_DEBUG; do

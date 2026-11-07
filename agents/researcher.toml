@@ -3,10 +3,10 @@
 # sent to the model as a request parameter.
 prompt = "researcher"
 request_limit = 55
-timeout_s = 900
+timeout_s = 1800            # wall-clock cap per run of this agent (30 min); waiting for a free endpoint not counted
 max_fetches = 10
 min_fetches = 2             # output validator rejects findings below this
-max_searches = 25
+max_searches = 10          # web_search calls per researcher (cached/shared ones count too)
 pdf_page_limit = 100         # pages docling converts per PDF
 pdf_char_limit = 40000      # chars kept from each PDF
 page_char_limit = 10000     # chars kept from each HTML page

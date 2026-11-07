@@ -13,9 +13,16 @@ three self-hosted services. No cloud API keys are needed.
   completions and tool calling.
 - **Survives failures:** a failed planner, researcher or writer degrades the
   run instead of aborting it, and every stage of every run is saved to disk.
-- **Observable:** a live progress page shows what every sub-agent is doing,
-  with token, request, search and fetch counts. Optional OpenTelemetry tracing
-  records every model call and tool call in Arize Phoenix.
+- **Multiple LLM endpoints:** named profiles for any OpenAI-compatible server
+  (vLLM, llama.cpp, LM Studio, Ollama, OpenRouter…) or Anthropic's API. Each
+  agent role gets its own, and researchers can share a pool of endpoints, each
+  with its own concurrency limit.
+- **Observable and controllable:** a live progress page shows what every
+  sub-agent is doing, with token, request, search and fetch counts. Its
+  buttons finalize, restart or stop individual researchers, wrap up or abort
+  a run, and re-run, edit or add sub-questions afterwards. Optional
+  OpenTelemetry tracing records every model call and tool call in Arize
+  Phoenix.
 - **Configured in files:** prompts are Markdown and limits are TOML; the code
   doesn't need editing for tuning.
 
@@ -52,7 +59,7 @@ so the services can share one machine or be spread across several.
 2. [Requirements](#2-requirements)
 3. [Configuration](#3-configuration)
 4. [How it works](#4-how-it-works)
-5. [Watching a run](#5-watching-a-run)
+5. [Watching and controlling a run](#5-watching-and-controlling-a-run)
 6. [Setting up the services](#6-setting-up-the-services)
 7. [Setting up an LLM endpoint](#7-setting-up-an-llm-endpoint)
 8. [Troubleshooting](#8-troubleshooting)
@@ -75,6 +82,12 @@ pip install -U pip && pip install -r requirements.txt
 ./services write-env             # creates/updates sourceMe with their URLs and token
 $EDITOR sourceMe                 # set LLM_BASE_URL and LLM_MODEL
 source sourceMe
+# optional: several endpoints / models per agent (§3.2)
+cp endpoints.example.toml endpoints.toml
+
+# optional, recommended: enable more SearXNG engines so rate limits on one don't empty searches (§6.3)
+tools/searxng_engines.py --settings .services/searxng/settings.yml \
+    --restart research-swarm-searxng-1 recommend --apply
 
 python doctor.py                 # preflight: services reachable, tool calling works
 ./start_swarm                    # web chat UI on http://<host>:8000
@@ -110,7 +123,7 @@ terminal shows the same events, and `metrics.json` is saved either way.
 
 By default the swarm needs only two things from the server: chat completions and
 tool calling. It sends one system message per request and never sends
-`response_format` (see [§3.3](#33-structured-output-modes)).
+`response_format` (see [§3.4](#34-structured-output-modes)).
 
 | Server | Status | Server-side requirement |
 |---|---|---|
@@ -136,20 +149,94 @@ Copy `sourceMe.example` to `sourceMe` (gitignored), fill it in, and
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible base URL; must end in `/v1` |
+| `LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible base URL; must end in `/v1`. Used when there's no `endpoints.toml`, or referenced from it as `${LLM_BASE_URL}` |
 | `LLM_MODEL` | `qwen3.5-122b` | Model id as `/v1/models` reports it (llama-swap aliases work) |
 | `LLM_API_KEY` | `local` | Only if the server checks keys (llama.cpp `--api-key`, LM Studio, proxies) |
-| `LLM_OUTPUT_MODE` | *(unset)* | `prompted` / `native` / `tool`; overrides `output_mode` in every toml |
+| `LLM_OUTPUT_MODE` | *(unset)* | `prompted` / `native` / `tool`; overrides `output_mode` in every profile and toml |
 | `SEARXNG_URL` | `http://localhost:8888` | SearXNG base URL |
 | `CRAWL4AI_URL` | `http://localhost:11235` | Crawl4AI base URL |
 | `CRAWL4AI_API_TOKEN` | *(empty)* | Bearer token set on the Crawl4AI container |
 | `DOCLING_URL` | `http://localhost:5001` | docling-serve base URL |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Turns on tracing, e.g. `http://localhost:6006` for Phoenix (see [§5.2](#52-tracing-with-arize-phoenix)) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Turns on tracing, e.g. `http://localhost:6006` for Phoenix (see [§5.3](#53-tracing-with-arize-phoenix)) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | *(unset)* | Auth for the collector, e.g. `authorization=Bearer%20<token>`; `./services write-env` sets it for its Phoenix |
 | `PHOENIX_PROJECT_NAME` | `research-swarm` | Phoenix project the traces are filed under |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_SERVICE_NAME` | *(unset)*, `research-swarm` | Standard OpenTelemetry overrides: a traces-only endpoint (used as-is, no `/v1/traces` appended), and the service name on spans |
+| `SWARM_ENDPOINTS` | `./endpoints.toml` | Path of the endpoint profiles file ([§3.2](#32-llm-endpoints-endpointstoml)) |
 | `LLM_DEBUG` | *(unset)* | `1` dumps every LLM request/response to stderr |
 
-### 3.2 Agents (`agents/*.toml`, `prompts/*.md`)
+### 3.2 LLM endpoints (`endpoints.toml`)
+
+Which model each agent uses, and on which server. Without `endpoints.toml`
+there is a single endpoint, `default`, built from `LLM_BASE_URL`, `LLM_MODEL`
+and `LLM_API_KEY`, so a plain `sourceMe` setup works as-is. To use several:
+
+```bash
+cp endpoints.example.toml endpoints.toml     # gitignored: it may hold URLs and keys
+```
+
+```toml
+[profiles.local]                  # one profile per endpoint (or per model on one)
+provider = "openai"               # any OpenAI-compatible server
+base_url = "${LLM_BASE_URL}"      # ${VAR} / ${VAR:-default} read the environment
+model = "${LLM_MODEL}"
+api_key = "${LLM_API_KEY:-local}"
+max_concurrency = 4               # agents it serves at once
+
+[profiles.fast]                   # e.g. a second box on your tailnet
+provider = "openai"
+base_url = "http://<other-host>:8080/v1"
+model = "qwen3.6-35b-a3b"
+max_concurrency = 6
+
+[profiles.claude]
+provider = "anthropic"
+model = "claude-sonnet-5-5"
+api_key = "${ANTHROPIC_API_KEY}"
+output_mode = "tool"
+
+[agents]
+orchestrator = "local"            # web chat (restart to change)
+planner = "claude"
+researcher = ["local", "fast"]    # a pool
+writer = "claude"
+```
+
+| Profile key | Default | Meaning |
+|---|---|---|
+| `provider` | `openai` | `openai` (OpenAI-compatible `/v1/chat/completions`) or `anthropic` |
+| `base_url` | | Ends in `/v1` (openai only) |
+| `model` | | Model id as the endpoint names it |
+| `api_key` | `local` | Literal or `${ENV_VAR}`. Keep real keys in the environment |
+| `max_concurrency` | 4 | Agents this endpoint serves at once. Match vLLM `--max-num-seqs` / llama.cpp `--parallel` |
+| `output_mode` | *(agent toml)* | `prompted` / `native` / `tool` for this endpoint ([§3.4](#34-structured-output-modes)) |
+| `merge_system_messages` | `true` | Send instructions as one system message (Qwen-style templates reject a second) |
+| `json_object_output` | `false` | Let `prompted` mode send `response_format: json_object` |
+
+How it's used:
+
+- **Pools and concurrency.** Each stage (planner, every researcher attempt,
+  writer) takes a slot on an endpoint from its role's list and holds it until
+  it finishes. A researcher gets the least-busy endpoint in its pool that has
+  a free slot, or waits for one. The progress page shows each stage's endpoint
+  and the live load per endpoint (`local 3/4`). `max_workers` in
+  `swarm.toml` still caps researchers overall. Waiting for a slot doesn't
+  count against an agent's `timeout_s`.
+- **Edits apply to the next run.** `endpoints.toml` is re-read at the start of
+  every run and post-run job, with no restart needed, except for the
+  `orchestrator` line. It's validated at startup too, so a typo fails loudly.
+- **Check it:** `python doctor.py` tests every profile in use: reachable,
+  model listed, tool calling, `native` support (an API-key check for
+  Anthropic). `./show_config` prints the profiles with keys masked.
+- **Anthropic** needs the `anthropic` SDK (`pip install anthropic`;
+  included with the full `pydantic-ai` package) and `ANTHROPIC_API_KEY`.
+  Hosted models are billed per token, and a large run here can use several
+  hundred thousand input tokens, mostly researchers re-reading their growing
+  context. Put researchers on a local endpoint and the planner and writer on
+  the hosted one.
+- **Security.** Anyone who can reach the web UI can start runs that use these
+  endpoints, including billed ones. Keep port 8000 on a network you trust.
+
+### 3.3 Agents (`agents/*.toml`, `prompts/*.md`)
 
 Each agent has a toml file for limits and model settings, and a Markdown prompt
 named by its `prompt = "…"` key. `./show_config` prints all of it plus the
@@ -171,26 +258,37 @@ server instead of being enforced.
 | `preflight` | `true` | Check SearXNG and Crawl4AI before a run; abort if either is down or rejects its token |
 | `finalize_on_failure` | `true` | A failed researcher first retries just its answer from the pages it already read |
 | `researcher_retries` | 1 | Then re-runs only that researcher from scratch, up to this many times |
+| `searxng_dead_after` | 3 | Consecutive empty searches with failing upstream engines before the run aborts |
+| `searxng_categories` | `"general"` | SearXNG categories each search covers, e.g. `"general,news"` or `"general,news,science"`. Adds the engines enabled in those categories (Reuters, Bing News, arXiv, Google Scholar, PubMed…) |
+| `search_cache_hours` | 24 | Reuse results for an identical query (case and spacing ignored) across researchers, runs and restarts. `0` turns the cache off |
+| `search_min_interval_s` | 1.5 | Minimum gap between requests to SearXNG, across the whole process |
 
 **`agents/researcher.toml`**
 
 | Key | Value | Meaning |
 |---|---|---|
-| `output_mode` | `prompted` | See [§3.3](#33-structured-output-modes) |
+| `output_mode` | `prompted` | See [§3.4](#34-structured-output-modes) |
 | `request_limit` | 55 | Model calls per researcher (each tool round costs 1) |
-| `timeout_s` | 900 | Wall-clock cap per researcher |
-| `max_searches` | 25 | `web_search` budget |
+| `timeout_s` | 1800 | Wall-clock cap per researcher attempt (30 min). Time spent waiting for a free endpoint doesn't count |
+| `max_searches` | 10 | `web_search` budget (cached and shared searches count too) |
 | `max_fetches` / `min_fetches` | 10 / 2 | `fetch_page` attempts allowed / pages that must have been read successfully before an answer is accepted |
 | `page_char_limit` | 10000 | Characters kept per HTML page |
 | `pdf_page_limit` / `pdf_char_limit` | 100 / 40000 | Pages converted / characters kept per PDF |
 | `[model_settings]` | `temperature = 0.3`, `max_tokens = 16384` | Sent to the model |
 
 **`agents/planner.toml`**: `output_mode = "prompted"`, `request_limit = 5`,
-`timeout_s = 900`. **`agents/writer.toml`**: `request_limit = 5`,
-`timeout_s = 900`. **`agents/orchestrator.toml`** (web UI only): prompt and
-model settings.
+`timeout_s = 1800`, `stream = true`. **`agents/writer.toml`**:
+`request_limit = 5`, `timeout_s = 1800`, `stream = true`.
+**`agents/orchestrator.toml`** (web UI only): prompt and model settings.
 
-### 3.3 Structured output modes
+`stream = true` streams the model's output so the progress page can show it
+growing ("thinking… 4,210 chars, writing… 12,800 chars"). That matters for the
+planner and the writer, whose single request can run for many minutes. The
+endpoint must support streaming (vLLM, llama.cpp, strata and Anthropic do).
+Researchers don't stream, since streamed tool calls are less reliable on some
+servers.
+
+### 3.4 Structured output modes
 
 The planner returns a `Plan` and each researcher returns a `Finding`, both
 Pydantic models. pydantic-ai can obtain structured output from the model in
@@ -203,12 +301,13 @@ setting:
 | `native` | `response_format: json_schema` (constrained decoding) | Output is always valid JSON | Needs server support. Some servers (e.g. strata) refuse it combined with tools: `400 structured response_format with tools/MCP is not supported` |
 | `tool` | A forced `final_result` tool call | pydantic-ai's default | vLLM + Qwen3.5: the forced `tool_choice` makes xgrammar expect JSON while the model emits XML tool calls, and the call is dropped (`grammar_matcher.cc … trying to accept new token`) |
 
-Set the mode per agent in its toml, or set `LLM_OUTPUT_MODE` to override every
-agent. On a server where `doctor.py` reports that `native` works with tools
+Set the mode per agent in its toml, per endpoint with `output_mode` in its
+profile, or for everything with `LLM_OUTPUT_MODE` (that order, last wins). On a server where `doctor.py` reports that `native` works with tools
 (e.g. vLLM), `LLM_OUTPUT_MODE=native` gives the strongest guarantees.
 
-The shared model profile in `swarm_pydantic_ai.py` also overrides two
-pydantic-ai defaults that break local servers:
+For OpenAI-compatible endpoints, `endpoints.py` also overrides two pydantic-ai
+defaults that break local servers. Both are per-profile settings
+(`json_object_output`, `merge_system_messages`):
 
 - `supports_json_object_output=False`. Otherwise `prompted` sends
   `response_format: {"type": "json_object"}`, which brings back the
@@ -233,7 +332,11 @@ pydantic-ai defaults that break local servers:
    swapping in a concept it knows better for the one you asked about.
 3. **Researchers**: one per sub-question, up to `max_workers` in parallel. Each
    gets the full task, the key terms and its sub-question, plus two tools:
-   - `web_search(query)` → SearXNG, top 8 results with snippets
+   - `web_search(query)` → SearXNG, top 8 results with snippets. Searches go
+     through a shared layer (`search.py`): identical queries are answered from
+     a 24-hour cache or share one in-flight request, and requests to SearXNG
+     are spaced out. A five-researcher run used to fire 100+ near-simultaneous
+     searches, which is what gets SearXNG's upstream engines to suspend it
    - `fetch_page(url)` → Crawl4AI for HTML, docling-serve for `.pdf` (with OCR)
 
    It returns `Finding{subquestion, answer, sources}`.
@@ -272,22 +375,24 @@ run.
 
 | Failure | What happens |
 |---|---|
-| SearXNG or Crawl4AI down or misconfigured, found **before** the run | **Preflight** (search + one fetch, cached 5 min) aborts in about a second, before any tokens are spent. The message names the service and the fix |
+| SearXNG or Crawl4AI down or misconfigured, found **before** the run | **Preflight** (a search that must return results, plus one fetch; cached 5 min) aborts in about a second, before any tokens are spent. The message names the service and the fix |
 | The same, found **during** the run (Crawl4AI rejects its token, a service stops answering) | The run aborts at the first occurrence and every researcher is cancelled at once. Nothing keeps burning tokens on a dead service |
+| SearXNG's upstream engines are rate-limited or suspended (searches come back empty) | After `searxng_dead_after` consecutive empty searches that SearXNG reports as engine failures, the run aborts and names the engines (e.g. `brave: Suspended: too many requests`) |
 | Planner fails (timeout, invalid output after retries, server error) | One researcher is run on the whole task |
-| A researcher fails (invalid output after retries, request limit, model error, timeout) | **Only that researcher** is retried; the others' results are kept. (1) *Finalize*: if it read any pages, its own conversation is continued, with those pages still in context, and asked only for the answer (fresh retry budget, ≤4 requests). (2) If that fails, it is re-run from scratch up to `researcher_retries` times, told why the last attempt failed. (3) Only then is its sub-question reported as unanswered, with the reason |
+| A researcher fails (invalid output after retries, request limit, model error, timeout) | **Only that researcher** is retried; the others' results are kept. (0) *Keep its prose*: if its last move was writing an answer, just not as JSON, that text becomes the answer, with the pages it cites that it actually read as sources; no extra model call. (1) *Finalize*: if it read any pages, its own conversation is continued, with those pages still in context, and asked only for the answer (fresh retry budget, ≤4 requests). (2) If that fails, it is re-run from scratch up to `researcher_retries` times, told why the last attempt failed. (3) Only then is its sub-question reported as unanswered, with the reason |
 | Writer fails | The raw findings become the report, with a note at the top |
 | A single fetch or search fails | The error text goes back to the model, which picks another source |
-| The report has gaps | The orchestrator can call `run_research` at most once per user message (enforced in code), so it can't re-run the whole swarm on its own. Ask a follow-up if you want more |
+| The report has gaps | The orchestrator can call `run_research` at most once per user message (enforced in code), so it can't re-run the whole swarm on its own. Re-run or edit just the weak sub-question from `/progress` ([§5.2](#52-controlling-a-run)) |
 
 The run is saved to `reports/` whenever it reaches the end, even if every
-agent failed. An aborted run (dead service) stops before saving and says why.
+agent failed. An aborted run saves the findings that had finished, with a note
+saying why it stopped.
 The progress page shows retries as `retrying` with an attempt counter (`R2 ×2`)
 and the rejection reason in the event log.
 
 ---
 
-## 5. Watching a run
+## 5. Watching and controlling a run
 
 The chat UI shows `run_research` as a single tool call that can spin for an
 hour. Two complementary views show what's happening inside it.
@@ -307,13 +412,17 @@ The page updates live (Server-Sent Events) and shows, for each run:
   status (`pending` / `running` / `done` / `failed` / `timeout`), the
   sub-question it's working on, and what it's doing right now (`waiting for
   model`, `→ web_search(...)`, `→ fetch_page(https://…)`, `writing answer`).
-  It also shows searches and fetches against their budgets, model requests,
-  tokens in and out, and elapsed time. Researchers waiting for a free worker
-  show as `queued`.
-- **Event log:** timestamped searches, fetches, failures and stage
-  transitions.
-- **History:** the last 20 runs since the server started; older ones are
-  collapsed.
+  It also shows how long the current activity has lasted, which endpoint
+  profile serves the stage, searches and fetches against their budgets,
+  model requests, tokens in and out, and elapsed time. Researchers waiting
+  for a free worker show as `queued`. Streaming stages show their output
+  growing (`thinking… 4,210 chars, writing… 12,800 chars`).
+- **Endpoint load** in the header: agents in flight per endpoint against its
+  `max_concurrency`.
+- **Event log:** timestamped searches, fetches, failures, stage transitions,
+  and the writer's start and finish.
+- **History:** the last 20 runs. After a server restart the last 10 saved
+  runs are reloaded from `reports/`.
 
 Tokens and requests update after every model response, not only when an agent
 finishes. That shows the problems that are otherwise invisible: a researcher
@@ -321,13 +430,67 @@ burning searches without fetching, one stuck waiting on a model with queued
 requests, or input tokens growing as the conversation is re-sent each turn.
 
 Also served: `/progress/state` (JSON snapshot, all runs and full logs) and
-`/progress/events` (the SSE stream). The tracker lives in the web server
-process, so a restart (including a `--reload`) clears the page's history. Each
+`/progress/events` (the SSE stream). Live state lives in the web server
+process; a restart (including a `--reload`) reloads finished runs from their
+saved files, but kills any run in progress. Each
 run's final snapshot is kept as `reports/<run id>/metrics.json`: per-stage
 timing, requests, tokens, searches, fetches and the full event log. That file
 is written for CLI runs too.
 
-### 5.2 Tracing with Arize Phoenix
+### 5.2 Controlling a run
+
+Buttons on `/progress` act on a run while it's going and after it has finished.
+
+**While it runs**
+
+| Control | Where | What it does |
+|---|---|---|
+| **Finalize** | researcher row | Stop researching and answer now from the pages already read. Its tools refuse further calls, and one page read is enough |
+| **Restart** | researcher row | Throw away the current attempt and start that researcher over. Doesn't use up a `researcher_retries` attempt |
+| **Stop** | researcher row | Give up on that sub-question; the report says it wasn't answered. On a queued researcher, it's skipped |
+| **Stop** | planner / writer row | Planner: one researcher takes the whole task. Writer: the raw findings become the report |
+| **Wrap up** | run | Every running researcher finalizes from what it has read, queued ones are skipped, then the writer runs as normal |
+| **Abort run** | run | Stop everything now. Finished findings are saved to `reports/<run>/` with a note; there's no synthesized report |
+
+**After it finishes**
+
+| Control | Where | What it does |
+|---|---|---|
+| **Re-run** | researcher row | Research that sub-question again from scratch, then rewrite the report |
+| **Edit…** | researcher row | Change the sub-question, research it, then rewrite the report |
+| **Add sub-question…** | run | Research one more sub-question (`R6`, …), then rewrite the report |
+| **Rewrite report** | run, or **Re-run** on the writer row | Run the writer again on the current findings |
+| **Stop job** | run | Stop a re-run, add or rewrite; the previous report stays as it was |
+| **View report** | run | The current `report.md`; `v1`, `v2`… are the earlier versions |
+
+Each re-run, add or rewrite replaces `report.md`, `full.md`, the `finding-N.md`
+files and `findings.json` in the run's folder. The previous report is kept as
+`report.vN.md`. Post-run jobs share the researcher worker limit (`max_workers`)
+with any other run.
+
+Things to know:
+
+- **The chat isn't updated by post-run jobs.** The chat answer is the report
+  as it was when the run finished; use **View report** for the current one.
+- **Closing the chat tab doesn't stop a run.** It keeps going in the
+  background, saves its report, and stays visible on `/progress`. Use
+  **Abort run** to stop it.
+- **Runs survive a restart, finished ones at least.** The last 10 runs with a
+  saved `metrics.json` and `findings.json` are reloaded on startup, with
+  their post-run controls working (re-run, edit, add, rewrite). Older ones
+  load on demand when a control names them. A run that was *in progress*
+  during a restart is lost; its finished findings are not saved until the
+  end.
+- **Endpoint:** `POST /progress/api/<run id>/<action>` with a JSON body
+  (`stage` with `{"key": "R2", "cmd": "finalize" | "restart" | "stop"}`,
+  `wrapup`, `abort`, `rerun` with `{"key", "subquestion"?}`, `add` with
+  `{"subquestion"}`, `rewrite`). Requests must send `X-Swarm-Control: 1`, which
+  a browser won't send cross-site without a CORS preflight this server never
+  approves, so other websites can't press the buttons for you. Like the chat
+  itself, the controls have no login: anyone who can reach port 8000 can use
+  them.
+
+### 5.3 Tracing with Arize Phoenix
 
 [Phoenix](https://github.com/Arize-ai/phoenix) is a self-hosted trace viewer
 for LLM apps. With tracing on, every swarm run becomes one trace: a
@@ -417,7 +580,7 @@ Notes:
 - **Image sizes.** The first `up` downloads about 400 MB for SearXNG, about
   6 GB for Crawl4AI and about 15 GB for docling (Phoenix is about 300 MB). To
   skip PDFs, leave docling out: `./services up searxng crawl4ai`.
-- **Phoenix** is optional and covered in [§5.2](#52-tracing-with-arize-phoenix).
+- **Phoenix** is optional and covered in [§5.3](#53-tracing-with-arize-phoenix).
 
 ### 6.2 Manual `docker run`
 
@@ -476,6 +639,98 @@ The OCR and layout models ship inside the image, so no cache volume is needed.
 CUDA-tagged images speed up OCR. A test UI is at `/ui`. "RapidOCR returned empty
 result" warnings on born-digital PDFs are harmless.
 
+### 6.3 More search engines for SearXNG
+
+SearXNG's defaults enable only a few web engines (here: Brave, DuckDuckGo and
+Google CSE). Heavy automated use gets those rate-limited or suspended
+(`too many requests`, `CAPTCHA`, `access denied`), and then every search comes
+back empty. Several capable engines ship **disabled** (Bing, Yahoo, Mwmbl,
+Yandex, Google, …). Enabling the ones that work from your host spreads the
+load, so one suspension no longer empties the results.
+
+**With the script.** [`tools/searxng_engines.py`](tools/searxng_engines.py)
+works with any SearXNG, not just this project's. It needs only Python's
+standard library to read, plus PyYAML to edit.
+
+Typical fix: see what's failing, probe the disabled engines, enable the ones
+that answer, and restart. Pick the block for how your SearXNG was started:
+
+```bash
+source sourceMe                      # sets SEARXNG_URL for the script
+
+# SearXNG started by ./services
+tools/searxng_engines.py status
+tools/searxng_engines.py recommend
+tools/searxng_engines.py --settings .services/searxng/settings.yml \
+    --restart research-swarm-searxng-1 recommend --apply
+
+# Your own container: here named "searxng", with its config directory
+# mounted from ~/searxng (as in older versions of §6.2)
+tools/searxng_engines.py status
+tools/searxng_engines.py recommend
+sudo chown $USER ~/searxng/settings.yml     # SearXNG chowns a mounted config dir to uid 977
+tools/searxng_engines.py --settings ~/searxng/settings.yml --restart searxng recommend --apply
+
+tools/searxng_engines.py status      # afterwards: the test query should return results again
+```
+
+`recommend` only reports; `--apply` writes `settings.yml` (keeping a backup)
+and restarts the container. The full command set:
+
+```bash
+export SEARXNG_URL=http://localhost:8888          # or pass --url
+
+tools/searxng_engines.py status                   # enabled engines, their error rates, a live test query
+tools/searxng_engines.py probe bing yahoo qwant   # query engines one at a time (enabled or not)
+tools/searxng_engines.py recommend                # probe the disabled web engines; list the ones that answer
+
+# enable the ones that answered, then restart SearXNG so it reloads settings.yml:
+tools/searxng_engines.py --settings <settings.yml> --restart <container> recommend --apply
+tools/searxng_engines.py --settings <settings.yml> --restart <container> enable bing yahoo
+tools/searxng_engines.py --settings <settings.yml> --restart <container> disable duckduckgo
+tools/searxng_engines.py --settings <settings.yml> suspend-times --too-many-requests 600
+```
+
+- **Which file and container.** For the `./services` SearXNG:
+  `--settings .services/searxng/settings.yml --restart research-swarm-searxng-1`.
+  For your own, use the file mounted at `/etc/searxng/settings.yml` and the
+  container's name.
+- **File permissions.** If you mounted the whole config directory, SearXNG
+  probably chowned the file to uid 977. Run `sudo chown $USER
+  <settings.yml>` first; the script tells you if it can't write.
+- **Backups.** Every edit keeps a timestamped backup next to the file, or in
+  `~/.local/state/searxng_engines/` when the directory isn't writable (a
+  config directory mounted into SearXNG stays owned by uid 977 even after you
+  `chown` the file). The script prints where. YAML comments survive only in
+  the backup.
+- **Safety check.** Engine names are checked against the running SearXNG
+  first. A name it doesn't know would make SearXNG fail to start.
+- **Probe sparingly.** Probes are spaced 2 s apart (`--delay`). Results depend
+  on your host's IP, so "works" means "works from here, right now".
+
+**By hand.** With `use_default_settings: true` at the top of `settings.yml`,
+list only the engines you want to change; SearXNG merges each entry into its
+built-in definition by name:
+
+```yaml
+use_default_settings: true
+engines:
+  - name: bing
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: duckduckgo     # keeps getting CAPTCHAs from this host
+    disabled: true
+search:
+  suspended_times:       # seconds an engine is benched after an error
+    SearxEngineTooManyRequests: 600
+```
+
+Then `docker restart <container>`. Names must match the engine names SearXNG
+uses: `status` lists them, as does `GET /config` (the `engines[].name`
+fields). Engines in other categories (`news`, `science`) only take part in the
+swarm's searches if their category is in `searxng_categories`.
+
 ---
 
 ## 7. Setting up an LLM endpoint
@@ -493,7 +748,8 @@ llama-server -m model.gguf --jinja -c 65536 --parallel 4 --host 0.0.0.0 --port 8
 ```
 
 Then set `LLM_BASE_URL=http://<host>:<port>/v1` and `LLM_MODEL` to the served
-model id, and run `python doctor.py`.
+model id, and run `python doctor.py`. For more than one endpoint, add a
+profile per server in `endpoints.toml` ([§3.2](#32-llm-endpoints-endpointstoml)).
 
 [llama-swap](https://github.com/mostlygeek/llama-swap) in front of the server
 gives you one stable port and on-demand model loading.
@@ -525,11 +781,15 @@ Start with `python doctor.py`. Most problems show up as a FAIL line there.
 | `./services up` skips a service: "port … already in use" | Something else holds the port (often your own instance); use it, or change the port in `.services/env` |
 | `./services`: "docker is installed but not usable" | Start Docker, or add yourself to the `docker` group and log in again |
 | Can't edit SearXNG `settings.yml` (owned by uid 977) | The config directory was mounted; mount just the file read-only (see §6.2) |
-| SearXNG returns 0 results | Upstream engines are rate-limiting you; check `/stats` |
+| SearXNG returns 0 results / run aborted "upstream engines are failing" | Brave, Google, DuckDuckGo and others rate-limit or suspend SearXNG after heavy use (`Suspended: too many requests`). `python doctor.py` lists the failing engines. Fix: `tools/searxng_engines.py recommend --apply` enables the disabled engines that work from your host ([§6.3](#63-more-search-engines-for-searxng)); the search cache and throttle keep it from recurring |
 | `Crawl4AI rejected CRAWL4AI_API_TOKEN (HTTP 401)` / run aborted | The token in `sourceMe` doesn't match the container's (`docker inspect <container>` shows its env). Fix `sourceMe`, then **restart** `./start_swarm`: `--reload` re-imports code but keeps the old environment |
 | Crawl4AI 502 "Blocked by anti-bot protection" | Site-side; the researcher picks another source |
 | `PDF FETCH FAILED … no md_content` | docling-serve's response shape differs; the error lists the keys it got |
 | `/progress` is empty during a CLI run | The tracker lives in the web server process; CLI runs show progress in the terminal and save `metrics.json` |
+| A button says "run not found" | That run has no saved `metrics.json` + `findings.json` (it was in progress during a restart, or predates them) |
+| `endpoints.toml: …` error at startup or when a run starts | A profile is invalid; the message names it. Common: `base_url` not ending in `/v1`, or `${VAR}` not set in the shell that started the server (`source sourceMe` first) |
+| A stage sits at "waiting for a free endpoint" | Every endpoint in its pool is at `max_concurrency`; see the load in the page header. Raise the limit if the server can take it, or add an endpoint to the pool |
+| A button does nothing / "missing X-Swarm-Control header" | A proxy is stripping custom headers; let `X-Swarm-Control` through |
 | `/progress` stuck on "reconnecting…" | A proxy in front of uvicorn is buffering the event stream; disable buffering for `/progress/events` |
 | doctor: `tracing collector … HTTP 401` | The collector requires auth: run `./services write-env` (Phoenix) or set `OTEL_EXPORTER_OTLP_HEADERS` |
 | `Failed to export span batch` / connection refused in the log | `OTEL_EXPORTER_OTLP_ENDPOINT` points at a collector that isn't running; start it or unset the variable |
@@ -548,18 +808,23 @@ own logs for the other side.
 ├── swarm_pydantic_ai.py   # model, agents, tools, validator, run_swarm(); CLI entry point
 ├── swarm_web.py           # web chat UI (orchestrator agent + Agent.to_web())
 ├── agent_config.py        # loads agents/*.toml and prompts/*.md
-├── doctor.py              # preflight checks for every dependency
+├── doctor.py              # preflight checks for every dependency (every endpoint profile in use)
+├── endpoints.py           # endpoint profiles: loading, models, per-endpoint concurrency
+├── endpoints.example.toml # profile template → copy to endpoints.toml (gitignored)
+├── search.py              # shared SearXNG access: result cache, throttle, in-flight de-duplication
 ├── progress.py            # live run tracker behind /progress and metrics.json
 ├── tracing.py             # optional OpenTelemetry setup (Phoenix or any OTLP collector)
 ├── web/progress.html      # the live progress page
 ├── agents/                # per-agent limits and model settings; swarm.toml for fan-out
 ├── prompts/               # per-agent instructions (Markdown)
 ├── services               # start/stop/check SearXNG, Crawl4AI, docling, Phoenix (menu or subcommands)
+├── tools/searxng_engines.py   # inspect, probe and enable SearXNG engines (works with any SearXNG)
 ├── compose.yaml           # the Docker Compose project ./services drives
 ├── sourceMe.example       # environment template → copy to sourceMe (gitignored)
 ├── start_swarm            # uvicorn launcher for the web UI (port 8000)
 ├── show_config            # print all agent config, prompts and the current env
 ├── requirements.txt
 ├── reports/               # one folder per run (gitignored, created automatically)
-└── .services/             # ./services state: ports, tokens, secrets, SearXNG settings (gitignored)
+├── .services/             # ./services state: ports, tokens, secrets, SearXNG settings (gitignored)
+└── .cache/                # search result cache (gitignored)
 ```
