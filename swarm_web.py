@@ -17,9 +17,17 @@ orchestrator below is bound to the local model regardless. Check the docs if
 you want to change what the picker offers.
 """
 
+import asyncio
+import json
+from pathlib import Path
+
 from pydantic_ai import Agent
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 from agent_config import load_agent
+from progress import TRACKER
 
 # Reuse everything from the CLI version: model, agents, tools, run_swarm().
 from swarm_pydantic_ai import model, run_swarm
@@ -41,5 +49,46 @@ async def run_research(task: str) -> str:
     return await run_swarm(task)
 
 
-# The ASGI app uvicorn serves. Routes: / (chat UI), /api/chat, /api/configure, /api/health
+# --------------------------------------------------------------------------- #
+# Live progress page
+# --------------------------------------------------------------------------- #
+# The chat UI only shows the run_research tool call as one long spinner, so the
+# swarm's internals are served on a side page: /progress (HTML), pushed over
+# Server-Sent Events from /progress/events, with /progress/state as JSON.
+
+PROGRESS_HTML = Path(__file__).parent / "web" / "progress.html"
+
+
+async def progress_page(request: Request) -> FileResponse:
+    return FileResponse(PROGRESS_HTML, headers={"Cache-Control": "no-cache"})
+
+
+async def progress_state(request: Request) -> JSONResponse:
+    return JSONResponse(TRACKER.snapshot(logs_for=1000, log_lines=10_000))
+
+
+async def progress_events(request: Request) -> StreamingResponse:
+    async def stream():
+        seen = -1
+        while not await request.is_disconnected():
+            version = await TRACKER.wait_change(seen, timeout=15)
+            if version == seen:
+                yield ": keepalive\n\n"          # holds proxies and the browser open
+                continue
+            seen = version
+            yield f"data: {json.dumps(TRACKER.snapshot())}\n\n"
+            await asyncio.sleep(0.5)               # coalesce bursts of updates
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# The ASGI app uvicorn serves. Routes: / (chat UI), /api/chat, /api/configure,
+# /api/health, and the progress routes, which go first because the chat app
+# has a catch-all /{id} route.
 app = orchestrator.to_web()
+app.router.routes[0:0] = [
+    Route("/progress", progress_page),
+    Route("/progress/state", progress_state),
+    Route("/progress/events", progress_events),
+]

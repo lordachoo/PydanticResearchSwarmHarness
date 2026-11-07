@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swarm Progress</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d232b; --muted: #66707c; --line: #e2e5ea;
+    --accent: #2f6fde; --ok: #1f8a4c; --warn: #b7791f; --bad: #c43c3c; --run: #2f6fde; --idle: #8a939e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --panel: #1a1e25; --text: #e3e7ec; --muted: #8e98a4; --line: #2a303a;
+      --accent: #6d9cf0; --ok: #4cc27f; --warn: #e0a84a; --bad: #ec6b6b; --run: #6d9cf0; --idle: #6f7884;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 1; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .conn { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .dot.live { background: var(--ok); }
+  main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .run { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 16px; overflow: hidden; }
+  .run > summary { list-style: none; cursor: pointer; padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  .run > summary::-webkit-details-marker { display: none; }
+  .task { font-weight: 600; flex: 1 1 360px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+          text-transform: uppercase; letter-spacing: .03em; border: 1px solid currentColor; white-space: nowrap; }
+  .s-running { color: var(--run); } .s-done { color: var(--ok); } .s-failed, .s-timeout { color: var(--bad); }
+  .s-pending, .s-skipped { color: var(--idle); }
+  .body { border-top: 1px solid var(--line); }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  td.key { font-family: var(--mono); font-weight: 600; white-space: nowrap; }
+  td.label { max-width: 340px; }
+  td.act { font-family: var(--mono); font-size: 12px; color: var(--muted); max-width: 420px; word-break: break-word; }
+  td.act.err { color: var(--bad); }
+  .bar { display: inline-block; width: 46px; height: 5px; background: var(--line); border-radius: 3px; vertical-align: middle; margin-left: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .log { margin: 0; }
+  .log > summary { cursor: pointer; padding: 8px 16px; color: var(--muted); font-size: 12px; }
+  .log ol { list-style: none; margin: 0; padding: 0 16px 12px; max-height: 320px; overflow-y: auto;
+            font-family: var(--mono); font-size: 12px; }
+  .log li { padding: 1px 0; display: flex; gap: 10px; }
+  .log .t { color: var(--muted); flex: none; }
+  .log .st { color: var(--accent); flex: none; min-width: 64px; }
+  .log .m { word-break: break-word; }
+  .foot { padding: 8px 16px 12px; font-size: 12px; color: var(--muted); }
+  code { font-family: var(--mono); font-size: 12px; }
+  @media (max-width: 640px) {
+    header, main { padding-left: 16px; padding-right: 16px; }
+    td.label { max-width: 200px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Research swarm: live progress</h1>
+  <a href="/">← chat</a>
+  <span class="conn"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
+</header>
+<main id="runs"><div class="empty">No runs yet. Ask the chat a research question.</div></main>
+
+<script>
+const runsEl = document.getElementById("runs");
+const openRuns = new Set();      // run ids the user expanded
+const closedRuns = new Set();    // run ids the user collapsed
+const openLogs = new Set();
+let clockSkew = 0;               // server now - client now, seconds
+let last = null;
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtN = n => (n || 0).toLocaleString();
+const fmtK = n => n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : fmtN(n);
+const now = () => Date.now() / 1000 + clockSkew;
+function dur(start, end) {
+  if (!start) return "–";
+  let s = Math.max(0, Math.round((end || now()) - start));
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  return h ? `${h}h${String(m).padStart(2, "0")}m` : m ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+const clock = t => new Date(t * 1000).toLocaleTimeString([], {hour12: false});
+const pill = s => `<span class="pill s-${esc(s)}">${esc(s)}</span>`;
+const budget = (n, max) => max ? `${n}/${max}<span class="bar"><i style="width:${Math.min(100, 100 * n / max)}%"></i></span>` : (n ? n : "–");
+
+function isOpen(run, i) {
+  if (openRuns.has(run.run_id)) return true;
+  if (closedRuns.has(run.run_id)) return false;
+  return run.status === "running" || i === 0;
+}
+
+function renderRun(run, i) {
+  const t = run.totals;
+  const rows = run.stages.map(st => {
+    const act = st.error ? st.error : st.activity;
+    return `<tr>
+      <td class="key">${esc(st.key)}</td>
+      <td>${pill(st.status)}</td>
+      <td class="label" title="${esc(st.label)}">${esc(st.label)}</td>
+      <td class="act ${st.error ? "err" : ""}">${esc(act)}</td>
+      <td class="num">${st.max_searches ? budget(st.searches, st.max_searches) : "–"}</td>
+      <td class="num">${st.max_fetches ? budget(st.fetches, st.max_fetches) : "–"}</td>
+      <td class="num">${st.requests || "–"}</td>
+      <td class="num">${fmtK(st.input_tokens)} / ${fmtK(st.output_tokens)}</td>
+      <td class="num" data-start="${st.started || ""}" data-end="${st.ended || ""}">${dur(st.started, st.ended)}</td>
+    </tr>`;
+  }).join("");
+  const events = run.events.map(e =>
+    `<li><span class="t">${clock(e.t)}</span><span class="st">${esc(e.stage || "swarm")}</span><span class="m">${esc(e.msg)}</span></li>`
+  ).join("");
+  const logOpen = openLogs.has(run.run_id) ? "open" : "";
+  return `<details class="run" data-run="${esc(run.run_id)}" ${isOpen(run, i) ? "open" : ""}>
+    <summary>
+      ${pill(run.status)}
+      <span class="task" title="${esc(run.task)}">${esc(run.task)}</span>
+      <span class="meta">
+        <span><b data-start="${run.started}" data-end="${run.ended || ""}">${dur(run.started, run.ended)}</b> elapsed</span>
+        <span><b>${fmtN(t.requests)}</b> model requests</span>
+        <span><b>${fmtK(t.input_tokens)}</b> in / <b>${fmtK(t.output_tokens)}</b> out tokens</span>
+        <span><b>${t.searches}</b> searches · <b>${t.fetches}</b> fetches</span>
+      </span>
+    </summary>
+    <div class="body">
+      <div class="tablewrap"><table>
+        <thead><tr><th>Stage</th><th>Status</th><th>Working on</th><th>Activity</th>
+          <th class="num">Searches</th><th class="num">Fetches</th><th class="num">Requests</th>
+          <th class="num">Tokens in / out</th><th class="num">Time</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      ${run.events.length ? `<details class="log" data-log="${esc(run.run_id)}" ${logOpen}>
+        <summary>Event log (${run.events.length})</summary><ol>${events}</ol></details>` : ""}
+      <div class="foot">run <code>${esc(run.run_id)}</code>${run.report_dir ? ` · saved to <code>${esc(run.report_dir)}/</code>` : ""}</div>
+    </div>
+  </details>`;
+}
+
+function render(snap) {
+  last = snap;
+  if (!snap.runs.length) { runsEl.innerHTML = `<div class="empty">No runs yet. Ask the chat a research question.</div>`; return; }
+  // Keep each open log scrolled to the bottom if it already was.
+  const stick = {};
+  runsEl.querySelectorAll(".log ol").forEach(ol => {
+    const id = ol.closest(".log").dataset.log;
+    stick[id] = ol.scrollTop + ol.clientHeight >= ol.scrollHeight - 8;
+  });
+  runsEl.innerHTML = snap.runs.map(renderRun).join("");
+  runsEl.querySelectorAll(".log ol").forEach(ol => {
+    const id = ol.closest(".log").dataset.log;
+    if (stick[id] !== false) ol.scrollTop = ol.scrollHeight;
+  });
+}
+
+// Remember what the user expanded/collapsed across re-renders.
+runsEl.addEventListener("toggle", e => {
+  const d = e.target;
+  if (d.dataset.run) {
+    (d.open ? openRuns : closedRuns).add(d.dataset.run);
+    (d.open ? closedRuns : openRuns).delete(d.dataset.run);
+  } else if (d.dataset.log) {
+    d.open ? openLogs.add(d.dataset.log) : openLogs.delete(d.dataset.log);
+  }
+}, true);
+
+// Tick elapsed times between updates.
+setInterval(() => {
+  document.querySelectorAll("[data-start]").forEach(el => {
+    if (el.dataset.start && !el.dataset.end) el.textContent = dur(+el.dataset.start, null);
+  });
+}, 1000);
+
+function connect() {
+  const es = new EventSource("/progress/events");
+  const dot = document.getElementById("dot"), conn = document.getElementById("conn");
+  es.onopen = () => { dot.className = "dot live"; conn.textContent = "live"; };
+  es.onmessage = e => {
+    const snap = JSON.parse(e.data);
+    clockSkew = snap.now - Date.now() / 1000;
+    render(snap);
+  };
+  es.onerror = () => { dot.className = "dot"; conn.textContent = "reconnecting…"; };  // EventSource retries itself
+}
+connect();
+</script>
+</body>
+</html>

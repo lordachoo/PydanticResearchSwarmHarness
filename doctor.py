@@ -11,6 +11,7 @@ variables as swarm_pydantic_ai.py, so it checks exactly what the swarm will use.
 import json
 import os
 import sys
+import urllib.parse
 
 import httpx
 
@@ -21,6 +22,8 @@ SEARXNG = os.environ.get("SEARXNG_URL", "http://localhost:8888").rstrip("/")
 CRAWL4AI = os.environ.get("CRAWL4AI_URL", "http://localhost:11235").rstrip("/")
 CRAWL4AI_TOKEN = os.environ.get("CRAWL4AI_API_TOKEN", "")
 DOCLING = os.environ.get("DOCLING_URL", "http://localhost:5001").rstrip("/")
+OTLP = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or "").rstrip("/")
 
 failed = False
 
@@ -169,6 +172,35 @@ def check_docling(http: httpx.Client) -> None:
     report(r.status_code == 200, "docling-serve", f"HTTP {r.status_code}")
 
 
+def check_tracing(http: httpx.Client) -> None:
+    if not OTLP:
+        report(None, "tracing", "off (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
+        return
+    url = OTLP if OTLP.endswith("/v1/traces") else f"{OTLP}/v1/traces"
+    try:
+        # An empty protobuf export request is valid OTLP: proves the collector accepts traces.
+        headers = {"Content-Type": "application/x-protobuf"}
+        # Same header variable the OTLP exporter reads: "k=v,k2=v2", values URL-encoded.
+        for item in filter(None, (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                                  or os.environ.get("OTEL_EXPORTER_OTLP_HEADERS") or "").split(",")):
+            k, _, v = item.partition("=")
+            headers[k.strip()] = urllib.parse.unquote(v.strip())
+        r = http.post(url, content=b"", headers=headers, timeout=10)
+    except httpx.HTTPError as e:
+        report(False, "tracing collector", f"{url}: {e} (start it: ./services up phoenix, or unset the variable)")
+        return
+    if r.status_code in (401, 403):
+        report(False, "tracing collector", f"{url}: HTTP {r.status_code}; collector wants auth. "
+               "For ./services Phoenix run ./services write-env (sets OTEL_EXPORTER_OTLP_HEADERS)")
+        return
+    report(r.status_code < 300, "tracing collector", f"{url}: HTTP {r.status_code}")
+    try:
+        import opentelemetry.sdk  # noqa: F401
+        import opentelemetry.exporter.otlp.proto.http  # noqa: F401
+    except ImportError:
+        report(False, "tracing packages", "missing; pip install -r requirements.txt")
+
+
 def main() -> int:
     print(f"LLM      {LLM}  model={MODEL}")
     print(f"SearXNG  {SEARXNG}\nCrawl4AI {CRAWL4AI}\ndocling  {DOCLING}")
@@ -177,6 +209,7 @@ def main() -> int:
         check_searxng(http)
         check_crawl4ai(http)
         check_docling(http)
+        check_tracing(http)
         check_llm(http)
     print("\n" + ("Problems found; fix the FAIL lines above." if failed else "Ready."))
     return 1 if failed else 0

@@ -32,6 +32,7 @@ Env (or edit CONFIG):
     CRAWL4AI_API_TOKEN bearer token set on the container
     SEARXNG_URL        e.g. http://<services-host>:8888  (JSON API must be enabled)
     DOCLING_URL        e.g. http://<services-host>:5001  (docling-serve; PDFs go here)
+    OTEL_EXPORTER_OTLP_ENDPOINT  e.g. http://localhost:6006 (Phoenix); enables tracing
     LLM_DEBUG=1        dump raw HTTP request/response bodies to stderr
 """
 
@@ -55,6 +56,10 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 
 from agent_config import load_agent, load_swarm
+from progress import TRACKER, RunTracker, run_agent_tracked
+from tracing import setup_tracing, swarm_span
+
+setup_tracing()   # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -172,9 +177,20 @@ model = OpenAIChatModel(
 @dataclass
 class Deps:
     http: httpx.AsyncClient
+    key: str = "researcher"             # stage key in the progress tracker ("R1", …)
+    rt: RunTracker | None = None        # progress tracker for this run
     fetches: int = 0                    # fetches this researcher has made
     searches: int = 0                   # searches this researcher has made
     seen: set[str] = field(default_factory=set)
+
+
+def _note(deps: Deps, msg: str) -> None:
+    """Log a tool event to the terminal and the progress page, and refresh the
+    stage's search/fetch counters."""
+    print(f"[{deps.key}] {msg}")
+    if deps.rt:
+        deps.rt.update(deps.key, searches=deps.searches, fetches=deps.fetches)
+        deps.rt.log(msg, deps.key)
 
 
 # --------------------------------------------------------------------------- #
@@ -375,7 +391,7 @@ async def web_search(ctx: RunContext[Deps], query: str) -> str:
             "Fetch the best URLs you already have, or answer with what you have."
         )
     deps.searches += 1
-    print(f"[web_search] {query}")
+    _note(deps, f"search: {query}")
     try:
         r = await deps.http.get(
             f"{CONFIG['searxng_url']}/search",
@@ -384,11 +400,11 @@ async def web_search(ctx: RunContext[Deps], query: str) -> str:
         )
     except httpx.HTTPError as e:
         msg = f"SEARCH FAILED for {query!r}: {e}"
-        print(f"[web_search] {msg}")
+        _note(deps, msg)
         return msg
     if r.status_code != 200:
         msg = f"SEARCH FAILED for {query!r}: HTTP {r.status_code}: {r.text[:300]}"
-        print(f"[web_search] {msg}")
+        _note(deps, msg)
         return msg
     results = r.json().get("results", [])[:8]
     if not results:
@@ -424,13 +440,13 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     deps.fetches += 1
 
     if _is_pdf(url):
-        print(f"[fetch_page] (pdf via docling) {url}")
+        _note(deps, f"fetch (pdf via docling): {url}")
         try:
             text = await _fetch_pdf_via_docling(deps.http, url)
         except httpx.HTTPError as e:
             text = f"PDF FETCH FAILED for {url}: {e}"
         if text.startswith("PDF FETCH FAILED"):
-            print(f"[fetch_page] {text[:200]}")
+            _note(deps, text[:200])
             return text
         return text[: RESEARCHER.get("pdf_char_limit", RESEARCHER["page_char_limit"] * 4)]
 
@@ -438,7 +454,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
     if CONFIG["crawl4ai_token"]:
         headers["Authorization"] = f"Bearer {CONFIG['crawl4ai_token']}"
 
-    print(f"[fetch_page] {url}")
+    _note(deps, f"fetch: {url}")
     try:
         r = await ctx.deps.http.post(
             f"{CONFIG['crawl4ai_url']}/md",
@@ -448,7 +464,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
         )
     except httpx.HTTPError as e:
         msg = f"FETCH FAILED for {url}: {e}"
-        print(f"[fetch_page] {msg}")
+        _note(deps, msg)
         return msg
 
     if r.status_code != 200:
@@ -456,7 +472,7 @@ async def fetch_page(ctx: RunContext[Deps], url: str) -> str:
         # run; it can choose another URL or answer without this page.
         body = r.text[:500]
         msg = f"FETCH FAILED for {url}: HTTP {r.status_code}: {body}"
-        print(f"[fetch_page] {msg}")
+        _note(deps, msg[:300])
         return msg
 
     data = r.json()
@@ -505,38 +521,87 @@ async def require_fetched_sources(ctx: RunContext[Deps], finding: Finding) -> Fi
 # Orchestration
 # --------------------------------------------------------------------------- #
 
+def _new_run_id() -> str:
+    """Timestamp id, also the report folder name; suffixed if one is taken."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id, n = stamp, 1
+    while run_id in TRACKER.runs or (REPORTS_DIR / run_id).exists():
+        n += 1
+        run_id = f"{stamp}-{n}"
+    return run_id
+
+
+REPORTS_DIR = Path(__file__).parent / "reports"
+
+
+def _reason(e: BaseException) -> str:
+    return "timed out" if isinstance(e, asyncio.TimeoutError) else (str(e) or type(e).__name__)
+
+
 async def run_swarm(task: str) -> str:
+    run_id = _new_run_id()
+    rt = TRACKER.start_run(run_id, task)
+    rt.log("run started")
+    with swarm_span(run_id, task):
+        try:
+            report = await _run_swarm(task, run_id, rt)
+        except BaseException as e:
+            rt.log(f"run failed: {_reason(e)}")
+            rt.finish("failed")
+            raise
+    return report
+
+
+async def _run_swarm(task: str, run_id: str, rt: RunTracker) -> str:
     async with httpx.AsyncClient() as http:
         # 1. Plan. If planning fails (timeout, bad JSON after retries, server
         #    error), degrade to a single researcher on the whole task rather
         #    than losing the run.
+        rt.add_stage("planner", "split the task into sub-questions")
+        rt.begin("planner")
         try:
             plan = (
                 await asyncio.wait_for(
-                    planner.run(task, usage_limits=UsageLimits(request_limit=PLANNER["request_limit"])),
+                    run_agent_tracked(
+                        planner, task, rt, "planner",
+                        usage_limits=UsageLimits(request_limit=PLANNER["request_limit"]),
+                    ),
                     timeout=PLANNER["timeout_s"],
                 )
             ).output
+            rt.end("planner", "done")
+            rt.update("planner", activity=f"{len(plan.subquestions)} sub-questions")
         except Exception as e:
-            reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
+            reason = _reason(e)
             print(f"[planner] FAILED ({reason}); falling back to one researcher on the whole task")
             log.debug("planner exception", exc_info=e)
+            rt.end("planner", "timeout" if isinstance(e, asyncio.TimeoutError) else "failed", reason)
+            rt.log(f"planner failed ({reason}); one researcher will take the whole task", "planner")
             # model_construct skips the min_length validation on key_terms.
             plan = Plan.model_construct(key_terms=[], subquestions=[task])
         print(f"[planner] key terms: {', '.join(plan.key_terms) or '(none)'}")
         print(f"[planner] {len(plan.subquestions)} sub-questions")
         for q in plan.subquestions:
             print(f"   - {q}")
+        rt.log(f"plan: {len(plan.subquestions)} sub-questions; key terms: "
+               f"{', '.join(plan.key_terms) or '(none)'}", "planner")
 
         # 2. Fan out researchers, bounded by a semaphore so we don't exceed
         #    the server's concurrency (vLLM --max-num-seqs / llama.cpp --parallel).
         sem = asyncio.Semaphore(SWARM.get("max_workers", 4))
+        for i, q in enumerate(plan.subquestions, 1):
+            rt.add_stage(f"R{i}", q, max_searches=RESEARCHER.get("max_searches", 3),
+                         max_fetches=RESEARCHER["max_fetches"])
+            rt.update(f"R{i}", activity="queued")
 
-        async def research(q: str) -> Finding:
+        async def research(i: int, q: str) -> Finding:
+            key = f"R{i}"
             async with sem:
-                print(f"[researcher] start: {q[:60]}")
+                print(f"[{key}] start: {q[:60]}")
+                rt.begin(key)
+                rt.log("started", key)
                 # Fresh Deps per researcher so fetch budgets don't bleed across workers.
-                rdeps = Deps(http=http)
+                rdeps = Deps(http=http, key=key, rt=rt)
                 try:
                     key_terms = ", ".join(plan.key_terms) or "(none identified)"
                     prompt = (
@@ -547,52 +612,60 @@ async def run_swarm(task: str) -> str:
                         "in the overall task (e.g. which kinds of sources to read)."
                     )
                     result = await asyncio.wait_for(
-                        researcher.run(
-                            prompt,
+                        run_agent_tracked(
+                            researcher, prompt, rt, key,
                             deps=rdeps,
-                            usage_limits=UsageLimits(
-                                request_limit=RESEARCHER["request_limit"]
-                            ),
+                            usage_limits=UsageLimits(request_limit=RESEARCHER["request_limit"]),
                         ),
                         timeout=RESEARCHER["timeout_s"],
                     )
-                    print(f"[researcher] done:  {q[:60]} ({rdeps.fetches} fetches)")
+                    print(f"[{key}] done:  {q[:60]} ({rdeps.fetches} fetches)")
+                    rt.end(key, "done")
+                    rt.log(f"done: {rdeps.fetches} fetches, {len(result.output.sources)} sources", key)
                     return result.output
                 except asyncio.TimeoutError:
-                    print(f"[researcher] TIMEOUT: {q[:60]}")
+                    print(f"[{key}] TIMEOUT: {q[:60]}")
+                    rt.end(key, "timeout", f"timed out after {RESEARCHER['timeout_s']}s")
+                    rt.log("timed out", key)
                     return Finding(subquestion=q, answer="Researcher timed out.", sources=[])
                 except Exception as e:  # request limit, validation, model errors
-                    print(f"[researcher] FAILED: {q[:60]}: {e}")
+                    print(f"[{key}] FAILED: {q[:60]}: {e}")
                     log.debug("researcher exception", exc_info=e)
+                    rt.end(key, "failed", _reason(e))
+                    rt.log(f"failed: {_reason(e)[:200]}", key)
                     return Finding(
                         subquestion=q,
                         answer=f"RESEARCHER FAILED (no verified sources): {e}",
                         sources=[],
                     )
 
-        findings = await asyncio.gather(*(research(q) for q in plan.subquestions))
+        findings = await asyncio.gather(*(research(i, q) for i, q in enumerate(plan.subquestions, 1)))
 
-        # 3. Synthesize
+        # 3. Synthesize. If the writer fails, the raw findings become the
+        #    report so the research is still saved and returned.
         findings_text = "\n\n".join(
             f"### {f.subquestion}\n{f.answer}\nSources: {', '.join(f.sources) or 'none'}"
             for f in findings
         )
-        # If the writer fails, the raw findings become the report so the
-        # research is still saved and returned.
+        rt.add_stage("writer", "synthesize the findings into the report")
+        rt.begin("writer")
         try:
             report = (
                 await asyncio.wait_for(
-                    writer.run(
-                        f"Task: {task}\n\nFindings:\n{findings_text}",
+                    run_agent_tracked(
+                        writer, f"Task: {task}\n\nFindings:\n{findings_text}", rt, "writer",
                         usage_limits=UsageLimits(request_limit=WRITER["request_limit"]),
                     ),
                     timeout=WRITER["timeout_s"],
                 )
             ).output
+            rt.end("writer", "done")
         except Exception as e:
-            reason = "timed out" if isinstance(e, asyncio.TimeoutError) else str(e)
+            reason = _reason(e)
             print(f"[writer] FAILED ({reason}); returning the raw findings instead")
             log.debug("writer exception", exc_info=e)
+            rt.end("writer", "timeout" if isinstance(e, asyncio.TimeoutError) else "failed", reason)
+            rt.log(f"writer failed ({reason}); returning raw findings", "writer")
             report = (
                 f"> The writer failed ({reason}), so these are the researchers' "
                 f"raw findings, unsynthesized.\n\n{findings_text}"
@@ -600,8 +673,7 @@ async def run_swarm(task: str) -> str:
 
         # 4. Persist every stage of the run so nothing is lost if the browser
         #    session dies or the orchestrator paraphrases the report.
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = Path(__file__).parent / "reports" / stamp
+        run_dir = REPORTS_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
         (run_dir / "task.md").write_text(f"# Task\n\n{task}\n", encoding="utf-8")
@@ -625,7 +697,14 @@ async def run_swarm(task: str) -> str:
             f"# {task}\n\n{report}\n\n---\n\n## Raw findings\n\n{findings_text}\n",
             encoding="utf-8",
         )
-        print(f"[swarm] saved {run_dir}/ (task, plan, {len(findings)} findings, report, full)")
+        rt.log(f"saved reports/{run_id}/")
+        rt.finish("done", report_dir=f"reports/{run_id}")
+        # metrics.json: per-stage timing, requests, tokens, searches, fetches, event log.
+        (run_dir / "metrics.json").write_text(json.dumps(rt.to_dict(), indent=2) + "\n", encoding="utf-8")
+        t = rt.to_dict()["totals"]
+        print(f"[swarm] saved {run_dir}/ (task, plan, {len(findings)} findings, report, full, metrics) "
+              f"| {t['requests']} requests, {t['input_tokens']:,} in / {t['output_tokens']:,} out tokens, "
+              f"{t['searches']} searches, {t['fetches']} fetches")
 
         return report
 

@@ -6,4 +6,7 @@ export CRAWL4AI_URL="http://127.0.0.1:11235"
 export CRAWL4AI_API_TOKEN="<token>"                   # bearer token set on the Crawl4AI container
 export SEARXNG_URL="http://<services-host>:8888"      # JSON format must be enabled
 export DOCLING_URL="http://<services-host>:5001"      # docling-serve; PDFs go here
+# Tracing to Phoenix (./services up phoenix, then ./services write-env fills these in):
+# export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:6006"
+# export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20<PHOENIX_ADMIN_SECRET>"
 # export LLM_DEBUG=1     # dump every request's message roles to stderr

@@ -13,6 +13,9 @@ three self-hosted services. No cloud API keys are needed.
   completions and tool calling.
 - **Survives failures:** a failed planner, researcher or writer degrades the
   run instead of aborting it, and every stage of every run is saved to disk.
+- **Observable:** a live progress page shows what every sub-agent is doing,
+  with token, request, search and fetch counts. Optional OpenTelemetry tracing
+  records every model call and tool call in Arize Phoenix.
 - **Configured in files:** prompts are Markdown and limits are TOML; the code
   doesn't need editing for tuning.
 
@@ -49,18 +52,19 @@ so the services can share one machine or be spread across several.
 2. [Requirements](#2-requirements)
 3. [Configuration](#3-configuration)
 4. [How it works](#4-how-it-works)
-5. [Setting up the services](#5-setting-up-the-services)
-6. [Setting up an LLM endpoint](#6-setting-up-an-llm-endpoint)
-7. [Troubleshooting](#7-troubleshooting)
-8. [Project layout](#8-project-layout)
+5. [Watching a run](#5-watching-a-run)
+6. [Setting up the services](#6-setting-up-the-services)
+7. [Setting up an LLM endpoint](#7-setting-up-an-llm-endpoint)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Project layout](#9-project-layout)
 
 ---
 
 ## 1. Quick start
 
 Assumes an LLM endpoint is already running (see
-[§6](#6-setting-up-an-llm-endpoint)). The three support services can be started
-for you with Docker (see [§5](#5-setting-up-the-services)).
+[§7](#7-setting-up-an-llm-endpoint)). The three support services can be started
+for you with Docker (see [§6](#6-setting-up-the-services)).
 
 ```bash
 git clone <this repo> research-swarm && cd research-swarm
@@ -74,6 +78,7 @@ source sourceMe
 
 python doctor.py                 # preflight: services reachable, tool calling works
 ./start_swarm                    # web chat UI on http://<host>:8000
+                                 # live progress on http://<host>:8000/progress
 ```
 
 To run from the command line without the web UI:
@@ -83,7 +88,9 @@ source sourceMe
 python swarm_pydantic_ai.py "When does NVIDIA Rubin ship, and what are its specs?"
 ```
 
-Results print to the terminal and are saved under `reports/<timestamp>/`.
+Results print to the terminal and are saved under `reports/<timestamp>/`. The
+live progress page is part of the web UI and isn't served for CLI runs; the
+terminal shows the same events, and `metrics.json` is saved either way.
 
 ---
 
@@ -113,7 +120,7 @@ tool calling. It sends one system message per request and never sends
 | SGLang, Ollama, LM Studio | expected to work, untested | tool calling enabled for the loaded model |
 
 The model must be good at tool calling. Thinking models are fine, but give
-them a large `max_tokens` (see [§7](#7-troubleshooting)).
+them a large `max_tokens` (see [§8](#8-troubleshooting)).
 
 `python doctor.py` checks this for you. It asks the model for a real tool call
 and reports whether `native` structured output would also work on this server.
@@ -137,6 +144,9 @@ Copy `sourceMe.example` to `sourceMe` (gitignored), fill it in, and
 | `CRAWL4AI_URL` | `http://localhost:11235` | Crawl4AI base URL |
 | `CRAWL4AI_API_TOKEN` | *(empty)* | Bearer token set on the Crawl4AI container |
 | `DOCLING_URL` | `http://localhost:5001` | docling-serve base URL |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Turns on tracing, e.g. `http://localhost:6006` for Phoenix (see [§5.2](#52-tracing-with-arize-phoenix)) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | *(unset)* | Auth for the collector, e.g. `authorization=Bearer%20<token>`; `./services write-env` sets it for its Phoenix |
+| `PHOENIX_PROJECT_NAME` | `research-swarm` | Phoenix project the traces are filed under |
 | `LLM_DEBUG` | *(unset)* | `1` dumps every LLM request/response to stderr |
 
 ### 3.2 Agents (`agents/*.toml`, `prompts/*.md`)
@@ -226,9 +236,10 @@ pydantic-ai defaults that break local servers:
    It returns `Finding{subquestion, answer, sources}`.
 4. **Writer**: writes one Markdown answer from all findings, with inline
    citations and a Sources section.
-5. **Save**: `reports/<YYYYMMDD-HHMMSS>/` gets `task.md`, `plan.md`,
-   `finding-N.md`, `report.md` (the final answer) and `full.md` (report plus
-   raw findings).
+5. **Save**: `reports/<run id>/` (the run id is a `YYYYMMDD-HHMMSS`
+   timestamp) gets `task.md`, `plan.md`, `finding-N.md`, `report.md` (the
+   final answer), `full.md` (report plus raw findings) and `metrics.json`
+   (see [§5.1](#51-live-progress-page)).
 
 ### 4.2 Grounding guards
 
@@ -261,14 +272,95 @@ The run is always saved to `reports/`, even if every agent fails.
 
 ---
 
-## 5. Setting up the services
+## 5. Watching a run
+
+The chat UI shows `run_research` as a single tool call that can spin for an
+hour. Two complementary views show what's happening inside it.
+
+### 5.1 Live progress page
+
+Open **`http://<host>:8000/progress`** next to the chat. The orchestrator also
+posts the link when it starts a run. The page updates live (Server-Sent Events)
+and shows, for each run:
+
+- **Run summary:** status, elapsed time, total model requests, input and
+  output tokens, searches and fetches.
+- **One row per stage** (planner, `R1`…`Rn`, writer). Each row shows the
+  status (`pending` / `running` / `done` / `failed` / `timeout`), the
+  sub-question it's working on, and what it's doing right now (`waiting for
+  model`, `→ web_search(...)`, `→ fetch_page(https://…)`, `writing answer`).
+  It also shows searches and fetches against their budgets, model requests,
+  tokens in and out, and elapsed time. Researchers waiting for a free worker
+  show as `queued`.
+- **Event log:** timestamped searches, fetches, failures and stage
+  transitions.
+- **History:** the last 20 runs since the server started; older ones are
+  collapsed.
+
+Tokens and requests update after every model response, not only when an agent
+finishes. That shows the problems that are otherwise invisible: a researcher
+burning searches without fetching, one stuck waiting on a model with queued
+requests, or input tokens growing as the conversation is re-sent each turn.
+
+Also served: `/progress/state` (JSON snapshot, all runs and full logs) and
+`/progress/events` (the SSE stream). The tracker lives in the web server
+process, so a restart (including a `--reload`) clears the page's history. Each
+run's final snapshot is kept as `reports/<run id>/metrics.json`: per-stage
+timing, requests, tokens, searches, fetches and the full event log. That file
+is written for CLI runs too.
+
+### 5.2 Tracing with Arize Phoenix
+
+[Phoenix](https://github.com/Arize-ai/phoenix) is a self-hosted trace viewer
+for LLM apps. With tracing on, every swarm run becomes one trace: a
+`research swarm` root span (under the orchestrator's span in the web UI), with
+the planner, each researcher and the writer nested inside. Every model request
+is recorded with its full prompt, response, token counts and latency, and every
+tool call with its arguments and result. Use it to answer "what did researcher
+2 actually read", "which call was slow" or "what did the model see when it went
+wrong", and to compare runs.
+
+```bash
+./services up phoenix            # prints the UI URL and admin login
+./services write-env             # adds OTEL_EXPORTER_OTLP_ENDPOINT and _HEADERS to sourceMe
+source sourceMe && python doctor.py   # "tracing collector: OK"
+./start_swarm
+```
+
+Open `http://localhost:6006` and log in as `admin@localhost` with the password
+`./services up phoenix` printed (also stored as `PHOENIX_ADMIN_PASSWORD` in
+`.services/env`). Traces are under the `research-swarm` project.
+
+Notes:
+
+- **Tracing is off unless the endpoint variable is set,** and it never blocks
+  the swarm: an unreachable collector only logs export warnings.
+- **Any OTLP/HTTP collector works.** Phoenix gets the most out of it, because
+  the [OpenInference](https://github.com/Arize-ai/openinference) span processor
+  converts pydantic-ai's spans into Phoenix's LLM views. Jaeger, Grafana Tempo,
+  Langfuse or Logfire work by pointing `OTEL_EXPORTER_OTLP_ENDPOINT` (and
+  `_HEADERS`, if the collector needs auth) at them.
+- **Phoenix as configured by `./services`** runs with authentication on,
+  because traces contain every prompt and response. The swarm authenticates
+  with the generated `PHOENIX_ADMIN_SECRET`. The bundled agent assistant (which
+  includes server-side bash and web access), code sandboxes and telemetry are
+  disabled; only the trace viewer is needed.
+- **Persistence and resets.** Traces persist in the `research-swarm_phoenix-data`
+  Docker volume. The admin password applies only when that volume is first
+  created. To reset it, run `./services down`, then
+  `docker volume rm research-swarm_phoenix-data`, then `./services up phoenix`.
+  This also deletes all stored traces.
+
+---
+
+## 6. Setting up the services
 
 The swarm needs SearXNG (search), Crawl4AI (HTML pages) and docling-serve
 (PDFs). They can run anywhere the swarm can reach; only the URLs in `sourceMe`
 matter. Already running your own? Skip this section and put their URLs in
 `sourceMe`.
 
-### 5.1 With `./services` (Docker Compose)
+### 6.1 With `./services` (Docker Compose)
 
 `./services` wraps [`compose.yaml`](compose.yaml). It needs Docker Engine with
 the Compose plugin. Run it with no arguments for a menu, or use subcommands:
@@ -276,17 +368,18 @@ the Compose plugin. Run it with no arguments for a menu, or use subcommands:
 | Command | What it does |
 |---|---|
 | `./services` | Interactive menu: status, start, stop, logs, write `sourceMe` |
-| `./services up [searxng crawl4ai docling]` | Start all services, or just the ones named; waits until each one answers HTTP |
+| `./services up [searxng crawl4ai docling phoenix \| all]` | Start the three core services, the ones named, or `all` (adds Phoenix); waits until each answers HTTP |
 | `./services status` | Container state and an HTTP health check per service |
 | `./services logs <service>` | Follow a service's logs |
-| `./services env` | Print the `sourceMe` lines for these services |
+| `./services env` | Print the `sourceMe` lines for these services (Phoenix's only while it's running) |
 | `./services write-env` | Write those lines into `sourceMe` (created from `sourceMe.example` if missing; old copy kept as `sourceMe.bak`) |
 | `./services down` | Stop and remove this project's containers |
 
 On first run it creates these files (both gitignored):
 
-- `.services/env`: bind address, ports, a generated Crawl4AI token and
-  optional image overrides. Mode 600. Edit it, then run `./services up` again.
+- `.services/env`: bind address, ports, a generated Crawl4AI token, generated
+  Phoenix secrets and admin password, and optional image overrides. Mode 600.
+  Edit it, then run `./services up` again.
 - `.services/searxng/settings.yml`: SearXNG config with the JSON API enabled,
   the rate limiter off and a random secret key. It is mounted read-only, so it
   stays editable on the host; run `docker compose --env-file .services/env
@@ -304,10 +397,11 @@ Notes:
 - **Isolation.** Everything runs as the Compose project `research-swarm`, so
   `./services down` only removes its own containers.
 - **Image sizes.** The first `up` downloads about 400 MB for SearXNG, about
-  6 GB for Crawl4AI and about 15 GB for docling. To skip PDFs, leave docling
-  out: `./services up searxng crawl4ai`.
+  6 GB for Crawl4AI and about 15 GB for docling (Phoenix is about 300 MB). To
+  skip PDFs, leave docling out: `./services up searxng crawl4ai`.
+- **Phoenix** is optional and covered in [§5.2](#52-tracing-with-arize-phoenix).
 
-### 5.2 Manual `docker run`
+### 6.2 Manual `docker run`
 
 The equivalent manual setup, if you'd rather manage containers yourself.
 
@@ -366,7 +460,7 @@ result" warnings on born-digital PDFs are harmless.
 
 ---
 
-## 6. Setting up an LLM endpoint
+## 7. Setting up an LLM endpoint
 
 Any server from the [compatibility table](#llm-endpoint-compatibility) works.
 Minimal examples:
@@ -392,7 +486,7 @@ growing conversation. Parallelism is capped by the server's concurrent slots.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 Start with `python doctor.py`. Most problems show up as a FAIL line there.
 
@@ -412,11 +506,16 @@ Start with `python doctor.py`. Most problems show up as a FAIL line there.
 | SearXNG 403 on `format=json` | Add `json` to `search.formats` in `settings.yml` |
 | `./services up` skips a service: "port … already in use" | Something else holds the port (often your own instance); use it, or change the port in `.services/env` |
 | `./services`: "docker is installed but not usable" | Start Docker, or add yourself to the `docker` group and log in again |
-| Can't edit SearXNG `settings.yml` (owned by uid 977) | The config directory was mounted; mount just the file read-only (see §5.2) |
+| Can't edit SearXNG `settings.yml` (owned by uid 977) | The config directory was mounted; mount just the file read-only (see §6.2) |
 | SearXNG returns 0 results | Upstream engines are rate-limiting you; check `/stats` |
 | Crawl4AI `401` | `CRAWL4AI_API_TOKEN` doesn't match the container's |
 | Crawl4AI 502 "Blocked by anti-bot protection" | Site-side; the researcher picks another source |
 | `PDF FETCH FAILED … no md_content` | docling-serve's response shape differs; the error lists the keys it got |
+| `/progress` is empty during a CLI run | The tracker lives in the web server process; CLI runs show progress in the terminal and save `metrics.json` |
+| `/progress` stuck on "reconnecting…" | A proxy in front of uvicorn is buffering the event stream; disable buffering for `/progress/events` |
+| doctor: `tracing collector … HTTP 401` | The collector requires auth: run `./services write-env` (Phoenix) or set `OTEL_EXPORTER_OTLP_HEADERS` |
+| `Failed to export span batch` / connection refused in the log | `OTEL_EXPORTER_OTLP_ENDPOINT` points at a collector that isn't running; start it or unset the variable |
+| No traces in Phoenix | Check the `research-swarm` project; confirm `[tracing] exporting traces to …` was printed at startup |
 
 **Inspecting requests:** `LLM_DEBUG=1 python swarm_pydantic_ai.py "…" 2> debug.log`,
 then `grep 'LLM request roles' debug.log` shows each request's message roles,
@@ -425,21 +524,24 @@ own logs for the other side.
 
 ---
 
-## 8. Project layout
+## 9. Project layout
 
 ```
 ├── swarm_pydantic_ai.py   # model, agents, tools, validator, run_swarm(); CLI entry point
 ├── swarm_web.py           # web chat UI (orchestrator agent + Agent.to_web())
 ├── agent_config.py        # loads agents/*.toml and prompts/*.md
 ├── doctor.py              # preflight checks for every dependency
+├── progress.py            # live run tracker behind /progress and metrics.json
+├── tracing.py             # optional OpenTelemetry setup (Phoenix or any OTLP collector)
+├── web/progress.html      # the live progress page
 ├── agents/                # per-agent limits and model settings; swarm.toml for fan-out
 ├── prompts/               # per-agent instructions (Markdown)
-├── services               # start/stop/check SearXNG, Crawl4AI, docling (menu or subcommands)
+├── services               # start/stop/check SearXNG, Crawl4AI, docling, Phoenix (menu or subcommands)
 ├── compose.yaml           # the Docker Compose project ./services drives
 ├── sourceMe.example       # environment template → copy to sourceMe (gitignored)
 ├── start_swarm            # uvicorn launcher for the web UI (port 8000)
 ├── show_config            # print all agent config, prompts and the current env
 ├── requirements.txt
 ├── reports/               # one folder per run (gitignored, created automatically)
-└── .services/             # ./services state: ports, token, SearXNG settings (gitignored)
+└── .services/             # ./services state: ports, tokens, secrets, SearXNG settings (gitignored)
 ```

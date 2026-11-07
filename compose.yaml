@@ -1,4 +1,5 @@
-# Support services for the research swarm: SearXNG, Crawl4AI, docling-serve.
+# Support services for the research swarm: SearXNG, Crawl4AI, docling-serve,
+# and optionally Arize Phoenix for traces.
 #
 # Use ./services (menu or subcommands) rather than calling this directly: it
 # writes .services/env (ports, bind address, Crawl4AI token) and the SearXNG
@@ -42,5 +43,32 @@ services:
     environment:
       DOCLING_SERVE_ENABLE_UI: "1"
 
+  # Optional trace viewer (./services up phoenix). Receives OpenTelemetry over
+  # OTLP/HTTP on the same port as its UI; the swarm exports to it when
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://<host>:6006 is set.
+  phoenix:
+    image: ${PHOENIX_IMAGE:-arizephoenix/phoenix:latest}
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PHOENIX_PORT:-6006}:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data     # traces persist in the phoenix-data volume
+      # Auth stays on: traces hold every prompt and response. The swarm sends
+      # PHOENIX_ADMIN_SECRET as a bearer token (OTEL_EXPORTER_OTLP_HEADERS);
+      # the UI login is admin@localhost / PHOENIX_ADMIN_PASSWORD. The
+      # password only applies when the data volume is first created.
+      PHOENIX_ENABLE_AUTH: "true"
+      PHOENIX_SECRET: ${PHOENIX_SECRET:?run ./services to generate it}
+      PHOENIX_ADMIN_SECRET: ${PHOENIX_ADMIN_SECRET:?run ./services to generate it}
+      PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD: ${PHOENIX_ADMIN_PASSWORD:?run ./services to generate it}
+      # Only the trace viewer is needed: no agent assistant (it ships with
+      # server-side bash and web access), no code sandboxes, no telemetry.
+      PHOENIX_DISABLE_AGENT_ASSISTANT: "true"
+      PHOENIX_ALLOWED_SANDBOX_PROVIDERS: "NONE"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+    volumes:
+      - phoenix-data:/mnt/data
+
 volumes:
   searxng-cache:
+  phoenix-data:

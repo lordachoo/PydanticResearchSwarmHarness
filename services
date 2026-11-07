@@ -3,7 +3,8 @@
 # docling-serve) with Docker Compose.
 #
 #   ./services                    interactive menu
-#   ./services up [svc ...]       start all, or the named services
+#   ./services up [svc ...]       start the core three, or the named services
+#                                 ("all" includes phoenix)
 #   ./services down               stop and remove this project's containers
 #   ./services status             container state + HTTP health per service
 #   ./services logs <svc>         follow one service's logs
@@ -11,7 +12,8 @@
 #   ./services write-env          put those lines into sourceMe (created from
 #                                 sourceMe.example if missing)
 #
-# Services: searxng crawl4ai docling
+# Core services: searxng crawl4ai docling
+# Optional:      phoenix  (trace viewer for OpenTelemetry; see tracing.py)
 # Settings (ports, bind address, Crawl4AI token, image tags) live in
 # .services/env, generated on first run. SearXNG's config is
 # .services/searxng/settings.yml. Both are gitignored.
@@ -22,7 +24,8 @@ cd "$(dirname "$0")"
 STATE=.services
 ENVFILE=$STATE/env
 SEARXNG_SETTINGS=$STATE/searxng/settings.yml
-ALL=(searxng crawl4ai docling)
+CORE=(searxng crawl4ai docling)
+ALL=(searxng crawl4ai docling phoenix)
 
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B= G= Y= R= N=; fi
 say()  { printf '%s\n' "$*"; }
@@ -32,6 +35,8 @@ err()  { printf '%s[fail]%s %s\n' "$R" "$N" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 random_string() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-48}"; }
+# Phoenix requires secrets with at least one digit and one lowercase letter.
+phoenix_secret() { printf 'p7%s' "$(random_string "${1:-46}")"; }
 
 # --------------------------------------------------------------------------- #
 # Prerequisites and first-run state
@@ -41,6 +46,10 @@ require_docker() {
     command -v docker >/dev/null || die "docker not found. Install Docker Engine: https://docs.docker.com/engine/install/"
     docker info >/dev/null 2>&1 || die "docker is installed but not usable by $(whoami). Start it, or: sudo usermod -aG docker \$USER (then log out/in)"
     docker compose version >/dev/null 2>&1 || die "the docker compose plugin is missing: https://docs.docker.com/compose/install/linux/"
+}
+
+ensure_key() {
+    grep -qE "^$1=" "$ENVFILE" || printf '%s=%s\n' "$1" "$2" >>"$ENVFILE"
 }
 
 init_state() {
@@ -59,10 +68,17 @@ CRAWL4AI_API_TOKEN=$(random_string 48)
 # SEARXNG_IMAGE=searxng/searxng:latest
 # CRAWL4AI_IMAGE=unclecode/crawl4ai:latest
 # DOCLING_IMAGE=ghcr.io/docling-project/docling-serve:latest
+# PHOENIX_IMAGE=arizephoenix/phoenix:latest
 EOF
         chmod 600 "$ENVFILE"
         ok "created $ENVFILE (with a new Crawl4AI token)"
     fi
+    # Keys added after an env file was first written: append without touching
+    # existing values.
+    ensure_key PHOENIX_PORT 6006
+    ensure_key PHOENIX_SECRET "$(phoenix_secret)"
+    ensure_key PHOENIX_ADMIN_SECRET "$(phoenix_secret)"
+    ensure_key PHOENIX_ADMIN_PASSWORD "$(phoenix_secret 22)"
     if [ ! -f "$SEARXNG_SETTINGS" ]; then
         cat >"$SEARXNG_SETTINGS" <<EOF
 # SearXNG settings for the swarm. Everything not set here uses SearXNG's defaults.
@@ -85,7 +101,10 @@ compose() { docker compose --env-file "$ENVFILE" "$@"; }
 
 port_of() {
     case $1 in
-        searxng) echo "$SEARXNG_PORT" ;; crawl4ai) echo "$CRAWL4AI_PORT" ;; docling) echo "$DOCLING_PORT" ;;
+        searxng)  echo "${SEARXNG_PORT:-8888}" ;;
+        crawl4ai) echo "${CRAWL4AI_PORT:-11235}" ;;
+        docling)  echo "${DOCLING_PORT:-5001}" ;;
+        phoenix)  echo "${PHOENIX_PORT:-6006}" ;;
     esac
 }
 image_of() {
@@ -93,9 +112,10 @@ image_of() {
         searxng)  echo "${SEARXNG_IMAGE:-searxng/searxng:latest}" ;;
         crawl4ai) echo "${CRAWL4AI_IMAGE:-unclecode/crawl4ai:latest}" ;;
         docling)  echo "${DOCLING_IMAGE:-ghcr.io/docling-project/docling-serve:latest}" ;;
+        phoenix)  echo "${PHOENIX_IMAGE:-arizephoenix/phoenix:latest}" ;;
     esac
 }
-size_hint() { case $1 in searxng) echo "~400 MB" ;; crawl4ai) echo "~6 GB" ;; docling) echo "~15 GB" ;; esac; }
+size_hint() { case $1 in searxng) echo "~400 MB" ;; crawl4ai) echo "~6 GB" ;; docling) echo "~15 GB" ;; phoenix) echo "~300 MB" ;; esac; }
 url_of() { echo "http://localhost:$(port_of "$1")"; }
 
 valid_service() { local s; for s in "${ALL[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
@@ -120,6 +140,7 @@ healthy() {
         searxng)  curl -fsS -m 10 -o /dev/null "$url/search?q=test&format=json" ;;
         crawl4ai) curl -fsS -m 10 -o /dev/null "$url/health" ;;
         docling)  curl -fsS -m 10 -o /dev/null "$url/health" ;;
+        phoenix)  curl -fsS -m 10 -o /dev/null "$url/" ;;
     esac
 }
 
@@ -139,7 +160,8 @@ wait_healthy() {
 
 cmd_up() {
     local want=("$@") start=() svc port
-    [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    [ ${#want[@]} -eq 0 ] && want=("${CORE[@]}")
+    [ "${want[*]}" = "all" ] && want=("${ALL[@]}")
     for svc in "${want[@]}"; do valid_service "$svc" || die "unknown service '$svc' (choose from: ${ALL[*]})"; done
 
     for svc in "${want[@]}"; do
@@ -165,6 +187,10 @@ cmd_up() {
     say
     say "Point the swarm at them with ${B}./services write-env${N} (updates sourceMe), or add:"
     cmd_env "${start[@]}"
+    for svc in "${start[@]}"; do
+        [ "$svc" = phoenix ] && say "Phoenix UI: $(url_of phoenix)  login admin@localhost / $PHOENIX_ADMIN_PASSWORD  (traces appear after the next swarm run)"
+    done
+    return 0
 }
 
 cmd_down() {
@@ -189,6 +215,14 @@ cmd_logs() {
     compose logs -f --tail 100 "$1"
 }
 
+# Core services always; phoenix only when it is running, since pointing the
+# swarm at an absent collector just produces export warnings.
+default_env_services() {
+    local s=("${CORE[@]}")
+    ours_running phoenix && s+=(phoenix)
+    echo "${s[*]}"
+}
+
 env_lines() {
     local svc
     for svc in "$@"; do
@@ -196,18 +230,20 @@ env_lines() {
             searxng)  echo "SEARXNG_URL=$(url_of searxng)" ;;
             crawl4ai) echo "CRAWL4AI_URL=$(url_of crawl4ai)"; echo "CRAWL4AI_API_TOKEN=$CRAWL4AI_API_TOKEN" ;;
             docling)  echo "DOCLING_URL=$(url_of docling)" ;;
+            phoenix)  echo "OTEL_EXPORTER_OTLP_ENDPOINT=$(url_of phoenix)"
+                      echo "OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer%20$PHOENIX_ADMIN_SECRET" ;;
         esac
     done
 }
 
 cmd_env() {
-    local want=("$@"); [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    local want=("$@"); [ ${#want[@]} -eq 0 ] && read -ra want <<<"$(default_env_services)"
     env_lines "${want[@]}" | sed 's/^\([^=]*\)=\(.*\)/    export \1="\2"/'
 }
 
 cmd_write_env() {
     local want=("$@") line key val
-    [ ${#want[@]} -eq 0 ] && want=("${ALL[@]}")
+    [ ${#want[@]} -eq 0 ] && read -ra want <<<"$(default_env_services)"
     if [ ! -f sourceMe ]; then
         cp sourceMe.example sourceMe
         ok "created sourceMe from sourceMe.example (set LLM_BASE_URL and LLM_MODEL in it)"
@@ -230,12 +266,12 @@ cmd_write_env() {
 
 pick_services() {
     local ans s picked=()
-    say "Which services? (space-separated numbers, Enter = all)" >&2
+    say "Which services? (space-separated numbers, Enter = the core three)" >&2
     local i=1; for s in "${ALL[@]}"; do say "  $i) $s  ($(size_hint "$s") image)" >&2; i=$((i + 1)); done
     read -rp "> " ans
-    [ -z "$ans" ] && { echo "${ALL[*]}"; return; }
+    [ -z "$ans" ] && { echo "${CORE[*]}"; return; }
     for i in $ans; do
-        [[ $i =~ ^[1-3]$ ]] && picked+=("${ALL[$((i - 1))]}") || { warn "ignoring '$i'" >&2; }
+        [[ $i =~ ^[1-4]$ ]] && picked+=("${ALL[$((i - 1))]}") || { warn "ignoring '$i'" >&2; }
     done
     echo "${picked[*]}"
 }
